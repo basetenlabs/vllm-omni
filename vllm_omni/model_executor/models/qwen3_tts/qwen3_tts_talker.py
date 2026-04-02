@@ -2,8 +2,10 @@ from __future__ import annotations
 
 import base64
 import dataclasses
+import hashlib
 import io
 import os
+from collections import OrderedDict
 from collections.abc import Callable, Iterable, Mapping
 from typing import Any
 from urllib.parse import urlparse
@@ -405,6 +407,13 @@ class Qwen3TTSTalkerForConditionalGeneration(nn.Module):
         # Tokenizer for prompt building.
         self._tokenizer = None
         self._speech_tokenizer: Qwen3TTSTokenizer | None = None
+
+        # LRU caches for voice clone encodings (ref_code + speaker embedding).
+        # Keyed by SHA-256 of (waveform bytes, sample rate) to avoid redundant
+        # encoder / ECAPA forward passes across requests using the same voice.
+        self._ref_code_cache: OrderedDict[str, torch.Tensor] = OrderedDict()
+        self._speaker_embed_cache: OrderedDict[str, torch.Tensor] = OrderedDict()
+        self._voice_cache_max_size = 64
 
     # -------------------- vLLM required hooks --------------------
 
@@ -1066,7 +1075,19 @@ class Qwen3TTSTalkerForConditionalGeneration(nn.Module):
             raise ValueError(f"ref_audio waveform too short: {wav_np.size} samples")
         return wav_np, sr
 
+    def _audio_cache_key(self, wav: np.ndarray, sr: int) -> str:
+        """Content-based cache key for reference audio."""
+        h = hashlib.sha256(wav.tobytes())
+        h.update(str(sr).encode())
+        return h.hexdigest()
+
     def _extract_speaker_embedding(self, wav: np.ndarray, sr: int) -> torch.Tensor:
+        cache_key = self._audio_cache_key(wav, sr)
+        cached = self._speaker_embed_cache.get(cache_key)
+        if cached is not None:
+            self._speaker_embed_cache.move_to_end(cache_key)
+            return cached.clone()
+
         if self.speaker_encoder is None:
             raise ValueError(
                 "This checkpoint does not provide `speaker_encoder` weights; "
@@ -1102,7 +1123,14 @@ class Qwen3TTSTalkerForConditionalGeneration(nn.Module):
             fmax=12000,
         ).transpose(1, 2)
         spk = self.speaker_encoder(mels.to(dev, dtype=torch.bfloat16))[0]
-        return spk.to(dtype=torch.bfloat16)
+        result = spk.to(dtype=torch.bfloat16)
+
+        self._speaker_embed_cache[cache_key] = result.detach().clone()
+        if len(self._speaker_embed_cache) > self._voice_cache_max_size:
+            self._speaker_embed_cache.popitem(last=False)
+        logger.info("Cached speaker embedding (key=%s..., cache_size=%d)", cache_key[:12], len(self._speaker_embed_cache))
+
+        return result
 
     def _ensure_speech_tokenizer_loaded(self) -> Qwen3TTSTokenizer:
         if self._speech_tokenizer is not None:
@@ -1134,6 +1162,12 @@ class Qwen3TTSTalkerForConditionalGeneration(nn.Module):
         return tok
 
     def _encode_ref_audio_to_code(self, wav: np.ndarray, sr: int) -> torch.Tensor:
+        cache_key = self._audio_cache_key(wav, sr)
+        cached = self._ref_code_cache.get(cache_key)
+        if cached is not None:
+            self._ref_code_cache.move_to_end(cache_key)
+            return cached.clone()
+
         tok = self._ensure_speech_tokenizer_loaded()
         enc = tok.encode(wav, sr=int(sr), return_dict=True)
         ref_code = getattr(enc, "audio_codes", None)
@@ -1143,7 +1177,14 @@ class Qwen3TTSTalkerForConditionalGeneration(nn.Module):
             # 12Hz: likely [T, Q] or [B, T, Q]
             if ref_code.ndim == 3:
                 ref_code = ref_code[0]
-            return ref_code.to(device=next(self.parameters()).device, dtype=torch.long)
+            result = ref_code.to(device=next(self.parameters()).device, dtype=torch.long)
+
+            self._ref_code_cache[cache_key] = result.detach().clone()
+            if len(self._ref_code_cache) > self._voice_cache_max_size:
+                self._ref_code_cache.popitem(last=False)
+            logger.info("Cached ref_code (key=%s..., frames=%d, cache_size=%d)", cache_key[:12], result.shape[0], len(self._ref_code_cache))
+
+            return result
         raise ValueError("SpeechTokenizer.encode did not return audio_codes tensor")
 
     def _generate_icl_prompt(
