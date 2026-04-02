@@ -73,6 +73,14 @@ class GPUARModelRunner(OmniGPUModelRunner):
         # each model stage has their own hidden size
         self.hidden_size = self.model_config.hf_text_config.hidden_size
         self.inputs_embeds = self._make_buffer(self.max_num_tokens, self.hidden_size, dtype=self.dtype, numpy=False)
+        # Pinned CPU buffer + dedicated CUDA stream for async D2H transfer of
+        # hidden states, allowing GPU work to overlap with the copy.
+        self._d2h_stream = torch.cuda.Stream()
+        self._d2h_event = torch.cuda.Event()
+        self._hidden_states_pinned = torch.empty(
+            self.max_num_tokens, self.hidden_size,
+            dtype=self.dtype, pin_memory=True,
+        )
         # Initialize KV cache manager (preserve vllm_config fallback behavior)
         self.kv_transfer_manager = OmniKVTransferManager.from_vllm_config(self.vllm_config, self.model_config)
 
@@ -547,7 +555,15 @@ class GPUARModelRunner(OmniGPUModelRunner):
         kv_connector_output = self.kv_connector_output
         self.kv_connector_output = None
 
-        hidden_states_cpu = hidden_states.detach().to("cpu").contiguous()
+        # Launch async D2H copy on a dedicated stream so that the GPU can
+        # continue running _process_additional_information_updates in parallel.
+        hs_len = hidden_states.shape[0]
+        hs_pinned = self._hidden_states_pinned[:hs_len]
+        self._d2h_stream.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(self._d2h_stream):
+            hs_pinned.copy_(hidden_states.detach(), non_blocking=True)
+        self._d2h_event.record(self._d2h_stream)
+
         num_scheduled_tokens_np = getattr(self, "_omni_num_scheduled_tokens_np", None)
         if num_scheduled_tokens_np is None:
             req_ids = self.input_batch.req_ids
@@ -560,18 +576,22 @@ class GPUARModelRunner(OmniGPUModelRunner):
             hidden_states, multimodal_outputs, num_scheduled_tokens_np, scheduler_output
         )
 
+        # Sync the async D2H before accessing CPU hidden states.
+        self._d2h_event.synchronize()
+        hidden_states_cpu = hs_pinned
+
         # Pre-copy multimodal tensors to CPU once (not per-request) to avoid
         # redundant D2H transfers when gpu_resident_buffer_keys keeps them on GPU.
         mm_cpu: dict[str, object] = {}
         if isinstance(multimodal_outputs, dict) and multimodal_outputs:
             for k, v in multimodal_outputs.items():
                 try:
-                    if isinstance(v, torch.Tensor) and v.shape[0] == hidden_states_cpu.shape[0]:
+                    if isinstance(v, torch.Tensor) and v.shape[0] == hs_len:
                         mm_cpu[k] = v.detach().to("cpu").contiguous()
                     elif isinstance(v, dict):
                         sub_dict: dict[str, torch.Tensor] = {}
                         for sk, sv in v.items():
-                            if isinstance(sv, torch.Tensor) and sv.shape[0] == hidden_states_cpu.shape[0]:
+                            if isinstance(sv, torch.Tensor) and sv.shape[0] == hs_len:
                                 sub_dict[str(sk)] = sv.detach().to("cpu").contiguous()
                         if sub_dict:
                             mm_cpu[k] = sub_dict
@@ -594,12 +614,12 @@ class GPUARModelRunner(OmniGPUModelRunner):
             start = int(self.query_start_loc.cpu[idx])
             sched = int(num_scheduled_tokens_np[idx])
             end = start + sched
-            hidden_slice = hidden_states_cpu[start:end]
+            hidden_slice = hidden_states_cpu[start:end].clone()
             payload: dict[str, object] = {"hidden": hidden_slice}
             if mm_cpu:
                 mm_payload: dict[str, object] = {}
                 for k, v in mm_cpu.items():
-                    if isinstance(v, torch.Tensor) and v.shape[0] == hidden_states_cpu.shape[0]:
+                    if isinstance(v, torch.Tensor) and v.shape[0] == hs_len:
                         mm_payload[k] = v[start:end].contiguous()
                     elif isinstance(v, dict):
                         mm_payload[k] = {sk: sv[start:end].contiguous() for sk, sv in v.items()}
