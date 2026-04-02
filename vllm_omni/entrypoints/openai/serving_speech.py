@@ -1096,6 +1096,18 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
         voice = request.voice
         ref_audio = request.ref_audio
         assert voice or ref_audio, "Either voice or ref_audio must be provided"
+
+        # Uploaded voices: read stored audio and treat as a clone request so
+        # the model receives reference waveforms rather than a preset name
+        # that only exists in the checkpoint's speaker_id list.
+        if voice is not None and ref_audio is None and voice.lower() in self.uploaded_speakers:
+            audio_data = self._get_uploaded_audio_data(voice)
+            if not audio_data:
+                raise ValueError(f"Audio file for uploaded voice '{voice}' is missing or corrupted")
+            ref_audio = audio_data
+            voice = None
+            logger.info("Voxtral: using uploaded voice clone audio for speaker '%s'", request.voice)
+
         # Strip data URI prefix — mistral_common expects raw base64
         if ref_audio is not None and isinstance(ref_audio, str) and ref_audio.startswith("data:"):
             _, _, ref_audio = ref_audio.partition(",")
