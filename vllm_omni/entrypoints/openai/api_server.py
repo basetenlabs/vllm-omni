@@ -1097,6 +1097,74 @@ async def upload_voice(
         return base(raw_request).create_error_response(message=f"Failed to upload voice: {str(e)}")
 
 
+@router.get("/v1/audio/voices/ready")
+async def voices_ready(raw_request: Request) -> JSONResponse:
+    """Readiness probe that gates on both engine health and voice loading.
+
+    Returns 200 only when the engine is healthy AND all required voices are
+    present. REQUIRED_VOICES accepts a comma-separated list of voice names
+    (e.g. "alice,bob")
+    When unset, the voice check is skipped and this behaves like /health.
+    """
+    # --- engine health (same logic as /health) ---
+    diffusion_engine = getattr(raw_request.app.state, "diffusion_engine", None)
+    if diffusion_engine is not None:
+        if not (hasattr(diffusion_engine, "is_running") and diffusion_engine.is_running):
+            return JSONResponse(
+                content={"status": "not_ready", "reason": "Diffusion engine is not running"},
+                status_code=HTTPStatus.SERVICE_UNAVAILABLE.value,
+            )
+    else:
+        engine_client = getattr(raw_request.app.state, "engine_client", None)
+        if engine_client is None:
+            return JSONResponse(
+                content={"status": "not_ready", "reason": "No engine initialized"},
+                status_code=HTTPStatus.SERVICE_UNAVAILABLE.value,
+            )
+        try:
+            await engine_client.check_health()
+        except Exception as exc:
+            return JSONResponse(
+                content={"status": "not_ready", "reason": f"Engine unhealthy: {exc}"},
+                status_code=HTTPStatus.SERVICE_UNAVAILABLE.value,
+            )
+
+    # --- voice readiness ---
+    speech_service: OmniOpenAIServingSpeech | None = getattr(
+        raw_request.app.state, "openai_serving_speech", None
+    )
+    loaded_names: set[str] = set()
+    if speech_service is not None:
+        loaded_names = {k.lower() for k in speech_service.uploaded_speakers}
+
+    required_env = os.getenv("REQUIRED_VOICES", "").strip()
+    required_names: list[str] = [
+        v.lower() for v in required_env.split(",") if v.strip()
+    ]
+
+    if required_names:
+        missing = sorted(set(required_names) - loaded_names)
+        if missing:
+            return JSONResponse(
+                content={
+                    "status": "not_ready",
+                    "reason": f"Waiting for voices: {missing}",
+                    "voices_loaded": sorted(loaded_names),
+                    "voices_missing": missing,
+                    "voices_required": sorted(required_names),
+                },
+                status_code=HTTPStatus.SERVICE_UNAVAILABLE.value,
+            )
+
+    return JSONResponse(
+        content={
+            "status": "ready",
+            "voices_loaded": sorted(loaded_names),
+            "voices_required": sorted(required_names),
+        }
+    )
+
+
 @router.delete(
     "/v1/audio/voices/{name}",
     responses={
@@ -2326,70 +2394,3 @@ async def stop_profile(raw_request: Request, request: ProfileRequest | None = No
         raise HTTPException(
             status_code=HTTPStatus.INTERNAL_SERVER_ERROR.value, detail=f"Failed to stop profiler: {str(e)}"
         )
-
-@router.get("/v1/audio/voices/ready")
-async def voices_ready(raw_request: Request) -> JSONResponse:
-    """Readiness probe that gates on both engine health and voice loading.
-
-    Returns 200 only when the engine is healthy AND all required voices are
-    present. REQUIRED_VOICES accepts a comma-separated list of voice names
-    (e.g. "alice,bob")
-    When unset, the voice check is skipped and this behaves like /health.
-    """
-    # --- engine health (same logic as /health) ---
-    diffusion_engine = getattr(raw_request.app.state, "diffusion_engine", None)
-    if diffusion_engine is not None:
-        if not (hasattr(diffusion_engine, "is_running") and diffusion_engine.is_running):
-            return JSONResponse(
-                content={"status": "not_ready", "reason": "Diffusion engine is not running"},
-                status_code=HTTPStatus.SERVICE_UNAVAILABLE.value,
-            )
-    else:
-        engine_client = getattr(raw_request.app.state, "engine_client", None)
-        if engine_client is None:
-            return JSONResponse(
-                content={"status": "not_ready", "reason": "No engine initialized"},
-                status_code=HTTPStatus.SERVICE_UNAVAILABLE.value,
-            )
-        try:
-            await engine_client.check_health()
-        except Exception as exc:
-            return JSONResponse(
-                content={"status": "not_ready", "reason": f"Engine unhealthy: {exc}"},
-                status_code=HTTPStatus.SERVICE_UNAVAILABLE.value,
-            )
-
-    # --- voice readiness ---
-    speech_service: OmniOpenAIServingSpeech | None = getattr(
-        raw_request.app.state, "openai_serving_speech", None
-    )
-    loaded_names: set[str] = set()
-    if speech_service is not None:
-        loaded_names = {k.lower() for k in speech_service.uploaded_speakers}
-
-    required_env = os.getenv("REQUIRED_VOICES", "").strip()
-    required_names: list[str] = [
-        v.lower() for v in required_env.split(",") if v.strip()
-    ]
-
-    if required_names:
-        missing = sorted(set(required_names) - loaded_names)
-        if missing:
-            return JSONResponse(
-                content={
-                    "status": "not_ready",
-                    "reason": f"Waiting for voices: {missing}",
-                    "voices_loaded": sorted(loaded_names),
-                    "voices_missing": missing,
-                    "voices_required": sorted(required_names),
-                },
-                status_code=HTTPStatus.SERVICE_UNAVAILABLE.value,
-            )
-
-    return JSONResponse(
-        content={
-            "status": "ready",
-            "voices_loaded": sorted(loaded_names),
-            "voices_required": sorted(required_names),
-        }
-    )
