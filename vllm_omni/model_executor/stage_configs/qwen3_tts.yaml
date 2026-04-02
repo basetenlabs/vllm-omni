@@ -16,9 +16,9 @@ stage_args:
       async_scheduling: true
       enable_prefix_caching: false
       engine_output_type: latent
-      gpu_memory_utilization: 0.3
+      gpu_memory_utilization: 0.50
       distributed_executor_backend: "mp"
-      max_num_batched_tokens: 2048
+      max_num_batched_tokens: 8192
       max_model_len: 4096
       custom_process_next_stage_input_func: vllm_omni.model_executor.stage_input_processors.qwen3_tts.talker2code2wav_async_chunk
     # Use named connector to apply runtime.connectors.extra.
@@ -48,13 +48,12 @@ stage_args:
       async_scheduling: true
       enable_prefix_caching: false
       engine_output_type: audio
-      gpu_memory_utilization: 0.3
+      gpu_memory_utilization: 0.15
       distributed_executor_backend: "mp"
-      # Must be divisible by num_code_groups and cover (left_context + chunk).
-      # Prefill length is Q * num_frames (e.g. 16 * 2148 = 34368); keep headroom past 32k.
-      max_num_batched_tokens: 65536
-      # async_chunk appends windows per step; max_model_len must cover accumulated flat codec stream.
-      max_model_len: 65536
+      # Must be divisible by num_code_groups and >= max_num_seqs * 800 to avoid precision issues.
+      max_num_batched_tokens: 32768
+      # Short sentences (~50-70 chars) produce ~5s audio; accumulated codec stream stays well under 32k.
+      max_model_len: 32768
     engine_input_source: [0]
     final_output: true
     final_output_type: audio
