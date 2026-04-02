@@ -356,6 +356,10 @@ class Qwen3TTSTalkerCodePredictorForConditionalGenerationVLLM(nn.Module):
         self._lm_heads_list: list[nn.Module] | None = None
         self._codec_embeds_list: list[nn.Module] | None = None
         self._cuda_graphs: dict[int, tuple[torch.cuda.CUDAGraph, torch.Tensor]] = {}
+        self._full_loop_graphs: dict[int, torch.cuda.CUDAGraph] = {}
+        self._static_all_codes: torch.Tensor | None = None
+        self._graph_temperature: float = 0.0
+        self._graph_top_k: int = 0
 
     def get_input_embeddings(self) -> nn.ModuleList:
         return self.model.get_input_embeddings()
@@ -424,6 +428,7 @@ class Qwen3TTSTalkerCodePredictorForConditionalGenerationVLLM(nn.Module):
         )
         self._warmup_buckets()
         self._capture_cuda_graphs()
+        self._capture_full_loop_graphs()
         logger.info("code_predictor: torch.compile (no epilogue fusion) + CUDA graphs")
 
     def _padded_bsz(self, bsz: int) -> int:
@@ -472,6 +477,71 @@ class Qwen3TTSTalkerCodePredictorForConditionalGenerationVLLM(nn.Module):
             self._cuda_graphs[bsz] = (g, static_output)
 
         logger.info("code_predictor: captured CUDA graphs for buckets %s", self._bucket_sizes)
+
+    def _capture_full_loop_graphs(self) -> None:
+        """Capture one CUDA graph per bucket spanning the entire
+        code-prediction loop (steps 1..Q-1).  A single replay() replaces
+        ~248 individual kernel launches, eliminating per-step launch overhead.
+
+        Batch elements are independent in the transformer (self-attention is
+        over the sequence dimension), so padded rows don't affect real rows.
+        """
+        from vllm.platforms import current_platform
+
+        pool = current_platform.get_global_graph_pool()
+
+        num_groups = self._num_groups
+        max_seq = num_groups + 1
+        proj_buf = self._proj_buf
+        projection = self.small_to_mtp_projection
+        model_fwd = self._compiled_model_fwd
+        lm_heads = self._lm_heads_list
+        codec_embeds = self._codec_embeds_list
+        device = proj_buf.device
+
+        max_bsz = self._vllm_config.scheduler_config.max_num_seqs
+        self._static_all_codes = torch.empty(
+            max_bsz, num_groups, dtype=torch.long, device=device,
+        )
+
+        temperature = 0.9
+        top_k = 50
+        inv_temp = 1.0 / max(temperature, 1e-6)
+        self._graph_temperature = temperature
+        self._graph_top_k = top_k
+
+        for bsz in self._bucket_sizes:
+            pos_ids = self._bucket_pos_ids[bsz]
+            codes_buf = self._static_all_codes[:bsz]
+            proj_buf[:bsz].zero_()
+
+            g = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(g, pool=pool):
+                for step in range(1, num_groups):
+                    hidden_out = model_fwd(
+                        proj_buf[:bsz, :max_seq, :], pos_ids,
+                    )
+                    logits = lm_heads[step - 1](hidden_out[:bsz, step, :])
+                    scaled = logits * inv_temp
+                    topk_vals, _ = scaled.topk(top_k, dim=-1)
+                    scaled = scaled.masked_fill(
+                        scaled < topk_vals[:, -1:], float("-inf"),
+                    )
+                    probs = F.softmax(scaled, dim=-1)
+                    next_ids = torch.multinomial(probs, num_samples=1)
+                    codes_buf[:, step] = next_ids.reshape(bsz)
+                    if step < num_groups - 1:
+                        new_embed = codec_embeds[step - 1](next_ids)
+                        proj_buf[:bsz, step + 1, :] = projection(
+                            new_embed.reshape(bsz, 1, -1),
+                        ).reshape(bsz, -1)
+
+            self._full_loop_graphs[bsz] = g
+
+        logger.info(
+            "code_predictor: captured full-loop CUDA graphs for buckets %s",
+            self._bucket_sizes,
+        )
 
     # ------------------------------------------------------------------
     #  Optimized forward: re-prefill + torch.compile + projection cache
@@ -531,7 +601,20 @@ class Qwen3TTSTalkerCodePredictorForConditionalGenerationVLLM(nn.Module):
         if full_pos_ids is None:
             full_pos_ids = torch.arange(max_seq, device=device, dtype=torch.long).unsqueeze(0).expand(padded_bsz, -1)
 
-        # Use captured CUDA graph if available, otherwise call compiled fn.
+        # Fast path: single graph replay covers the entire 31-step loop.
+        full_graph = self._full_loop_graphs.get(padded_bsz)
+        if (
+            full_graph is not None
+            and use_sampling
+            and top_k == self._graph_top_k
+            and abs(temperature - self._graph_temperature) < 1e-6
+        ):
+            self._static_all_codes[:bsz, 0] = layer0_code.reshape(bsz)
+            full_graph.replay()
+            all_codes = self._static_all_codes[:bsz].clone()
+            return all_codes
+
+        # Fallback: per-step execution with forward-only CUDA graphs.
         cuda_graph_entry = self._cuda_graphs.get(padded_bsz)
 
         for step in range(1, num_groups):
