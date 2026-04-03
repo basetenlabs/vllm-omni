@@ -7,6 +7,7 @@
 #   ./run_server.sh VoiceDesign 1.7B                   # 1.7B VoiceDesign
 #   ./run_server.sh Base 0.6B                          # 0.6B Base (voice clone)
 #   ./run_server.sh /path/to/local/model               # Local model directory
+#   SERVED_MODEL_NAME=my-tts ./run_server.sh           # Custom served model name
 
 set -e
 
@@ -37,12 +38,22 @@ else
     esac
 fi
 
+SERVED_MODEL_NAME="${SERVED_MODEL_NAME:-}"
+
 echo "Starting Qwen3-TTS server with model: $MODEL"
 
-vllm-omni serve "$MODEL" \
-    --stage-configs-path vllm_omni/model_executor/stage_configs/qwen3_tts.yaml \
-    --host 0.0.0.0 \
-    --port 8091 \
-    --gpu-memory-utilization 0.9 \
-    --trust-remote-code \
+SERVE_ARGS=(
+    --stage-configs-path vllm_omni/model_executor/stage_configs/qwen3_tts.yaml
+    --host 0.0.0.0
+    --port 8091
+    --gpu-memory-utilization 0.9
+    --trust-remote-code
     --omni
+)
+
+if [ -n "$SERVED_MODEL_NAME" ]; then
+    echo "Served model name: $SERVED_MODEL_NAME"
+    SERVE_ARGS+=(--served-model-name "$SERVED_MODEL_NAME")
+fi
+
+vllm-omni serve "$MODEL" "${SERVE_ARGS[@]}"
