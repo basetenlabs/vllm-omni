@@ -601,7 +601,7 @@ class Qwen3TTSTalkerCodePredictorForConditionalGenerationVLLM(nn.Module):
         if full_pos_ids is None:
             full_pos_ids = torch.arange(max_seq, device=device, dtype=torch.long).unsqueeze(0).expand(padded_bsz, -1)
 
-        # Fast path: single graph replay covers the entire 31-step loop.
+        # Fast path: single graph replay covers the entire 15-step loop.
         full_graph = self._full_loop_graphs.get(padded_bsz)
         if (
             full_graph is not None
@@ -614,7 +614,6 @@ class Qwen3TTSTalkerCodePredictorForConditionalGenerationVLLM(nn.Module):
             all_codes = self._static_all_codes[:bsz].clone()
             return all_codes
 
-        # Fallback: per-step execution with forward-only CUDA graphs.
         cuda_graph_entry = self._cuda_graphs.get(padded_bsz)
 
         for step in range(1, num_groups):

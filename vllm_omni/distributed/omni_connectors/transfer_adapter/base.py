@@ -85,13 +85,11 @@ class OmniTransferAdapterBase:
     def save_loop(self):
         """Loop to send outgoing data."""
         while not self.stop_event.is_set():
-            while self._pending_save_reqs:
-                task = self._pending_save_reqs.popleft()
-                try:
-                    self._send_single_request(task)
-                except Exception as e:
-                    logger.warning(f"Error saving data for {task.get('request_id')}: {e}")
-
+            if self._pending_save_reqs:
+                batch = []
+                while self._pending_save_reqs:
+                    batch.append(self._pending_save_reqs.popleft())
+                self._send_batch(batch)
             with self._save_cond:
                 if not self._pending_save_reqs and not self.stop_event.is_set():
                     self._save_cond.wait(timeout=0.1)
@@ -105,6 +103,20 @@ class OmniTransferAdapterBase:
         """Send one pending save request task to the connector.
         Subclasses should implement task-specific handling logic."""
         raise NotImplementedError
+
+    def _send_batch(self, tasks: list[dict[str, Any]]) -> None:
+        """Send a batch of pending save request tasks.
+
+        Default behavior is sequential for compatibility; subclasses can
+        override to implement true batched processing.
+        """
+        for task in tasks:
+            try:
+                self._send_single_request(task)
+            except Exception as e:
+                logger.warning(
+                    "Error saving data for %s: %s",
+                    task.get("request_id"), e)
 
     def load_async(self, *args, **kwargs):
         """Register a request to load data. To be implemented by subclasses."""

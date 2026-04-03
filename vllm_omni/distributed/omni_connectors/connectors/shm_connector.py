@@ -2,9 +2,13 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import fcntl
+import json
 import os
+import struct
 from multiprocessing import shared_memory as shm_pkg
 from typing import Any
+
+import numpy as np
 
 from vllm_omni.entrypoints.stage_utils import shm_read_bytes, shm_write_bytes
 
@@ -12,6 +16,84 @@ from ..utils.logging import get_connector_logger
 from .base import OmniConnectorBase
 
 logger = get_connector_logger(__name__)
+
+_CHUNK_FAST_MARKER = b'\xff'
+
+
+def _is_chunk_payload(data: Any) -> bool:
+    return isinstance(data, dict) and "code_predictor_codes" in data
+
+
+def _encode_chunk_fast(data: dict) -> bytes:
+    """Binary encode a chunk payload using struct + numpy (GIL-releasing)."""
+    codes = data["code_predictor_codes"]
+    left_context = data.get("left_context_size", 0)
+    finished = data.get("finished", False)
+    speaker = data.get("speaker")
+    language = data.get("language")
+
+    flags = (1 if speaker is not None else 0) | (
+        2 if language is not None else 0)
+    header = struct.pack("!iI?B", left_context, len(codes), finished, flags)
+
+    codes_arr = np.array(codes, dtype=np.int32)
+    parts = [_CHUNK_FAST_MARKER, header, codes_arr.tobytes()]
+
+    if speaker is not None:
+        sb = (speaker if isinstance(speaker, str)
+              else json.dumps(speaker)).encode("utf-8")
+        parts.append(struct.pack("!H", len(sb)))
+        parts.append(sb)
+    if language is not None:
+        lb = (language if isinstance(language, str)
+              else json.dumps(language)).encode("utf-8")
+        parts.append(struct.pack("!H", len(lb)))
+        parts.append(lb)
+
+    return b"".join(parts)
+
+
+def _decode_field(raw: str) -> Any:
+    """Decode a field that may be a plain string or JSON-encoded object."""
+    if raw.startswith(("[", "{")):
+        try:
+            return json.loads(raw)
+        except (json.JSONDecodeError, ValueError):
+            pass
+    return raw
+
+
+def _decode_chunk_fast(data: bytes) -> dict:
+    """Decode a binary chunk payload written by _encode_chunk_fast."""
+    offset = 1
+    left_context, n_codes, finished, flags = struct.unpack_from(
+        "!iI?B", data, offset)
+    offset += struct.calcsize("!iI?B")
+
+    codes = np.frombuffer(
+        data, dtype=np.int32, offset=offset, count=n_codes).tolist()
+    offset += n_codes * 4
+
+    result: dict[str, Any] = {
+        "code_predictor_codes": codes,
+        "left_context_size": left_context,
+        "finished": finished,
+    }
+
+    if flags & 1:
+        slen = struct.unpack_from("!H", data, offset)[0]
+        offset += 2
+        result["speaker"] = _decode_field(
+            data[offset:offset + slen].decode("utf-8"))
+        offset += slen
+    if flags & 2:
+        llen = struct.unpack_from("!H", data, offset)[0]
+        offset += 2
+        result["language"] = _decode_field(
+            data[offset:offset + llen].decode("utf-8"))
+        offset += llen
+
+    return result
 
 
 class SharedMemoryConnector(OmniConnectorBase):
@@ -41,11 +123,10 @@ class SharedMemoryConnector(OmniConnectorBase):
         data: Any,
     ) -> tuple[bool, int, dict[str, Any] | None]:
         try:
-            # Always serialize first to check size (and for SHM writing)
-            # Note: For extremely large objects in "inline" mode (e.g. Ray),
-            # we might double-serialize if we're not careful, but here we assume
-            # if it's huge we use SHM, or if Ray, threshold is maxsize.
-            payload = self.serialize_obj(data)
+            if _is_chunk_payload(data):
+                payload = _encode_chunk_fast(data)
+            else:
+                payload = self.serialize_obj(data)
             size = len(payload)
 
             # Currently, we always use SHM.
@@ -83,7 +164,10 @@ class SharedMemoryConnector(OmniConnectorBase):
                 fcntl.flock(lockf, fcntl.LOCK_EX)
                 data_bytes = shm_read_bytes(shm_handle)
                 fcntl.flock(lockf, fcntl.LOCK_UN)
-            obj = self.deserialize_obj(data_bytes)
+            if data_bytes and data_bytes[0:1] == _CHUNK_FAST_MARKER:
+                obj = _decode_chunk_fast(data_bytes)
+            else:
+                obj = self.deserialize_obj(data_bytes)
             return obj, int(shm_handle.get("size", 0))
         except Exception as e:
             logger.error(f"SharedMemoryConnector shm get failed for req : {e}")

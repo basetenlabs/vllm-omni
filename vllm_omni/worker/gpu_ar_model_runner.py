@@ -6,6 +6,7 @@ and also outputs sampled tokens.
 
 from __future__ import annotations
 
+import time as _time
 from copy import copy
 from typing import Any, NamedTuple
 
@@ -103,6 +104,15 @@ class GPUARModelRunner(OmniGPUModelRunner):
         scheduler_output: SchedulerOutput,
         intermediate_tensors: IntermediateTensors | None = None,
     ) -> OmniModelRunnerOutput | AsyncModelRunnerOutput | IntermediateTensors | None:
+        _t_exec_start = _time.perf_counter()
+        if not hasattr(self, "_prof"):
+            self._prof = {
+                "step": [], "fwd": [], "mtp": [], "bsz": [],
+                "gap": [], "last_end": 0.0,
+                "st_bookkeep": [], "st_d2h_launch": [],
+                "st_postproc": [], "st_d2h_sync": [], "st_pooler": [],
+            }
+
         if self.execute_model_state is not None:
             raise RuntimeError("State error: sample_tokens() must be called after execute_model() returns None.")
 
@@ -282,10 +292,6 @@ class GPUARModelRunner(OmniGPUModelRunner):
             # Mark KV scales as calculated after the first forward pass
             self.calculate_kv_scales = False
 
-        # Run the model.
-        # Use persistent buffers for CUDA graphs.
-        # When spec decode is enabled, defer connector finalization
-        # (wait_for_save + clear metadata) until after draft model runs.
         defer_kv_connector_finalize = self.speculative_config is not None
         with (
             set_forward_context(
@@ -304,6 +310,7 @@ class GPUARModelRunner(OmniGPUModelRunner):
                 defer_finalize=defer_kv_connector_finalize,
             ) as kv_connector_output,
         ):
+            _t_fwd = _time.perf_counter()
             model_output = self._model_forward(
                 input_ids=input_ids,
                 positions=positions,
@@ -314,6 +321,7 @@ class GPUARModelRunner(OmniGPUModelRunner):
                 logits_index=logits_indices,
                 sampler=self.sampler,
             )
+            self._prof["fwd"].append((_time.perf_counter() - _t_fwd) * 1000)
 
             # [Omni] Map pending ropes metadata to req_ids.
             if hasattr(self.model, "flush_pending_metadata"):
@@ -404,6 +412,33 @@ class GPUARModelRunner(OmniGPUModelRunner):
             slot_mappings,  # OMNI: pass slot_mappings for drafter
         )
         self.kv_connector_output = kv_connector_output
+
+        # --- profiling: record step timing ---
+        p = self._prof
+        _t_now = _time.perf_counter()
+        p["step"].append((_t_now - _t_exec_start) * 1000)
+        p["bsz"].append(num_reqs)
+        if p["last_end"] > 0:
+            p["gap"].append((_t_exec_start - p["last_end"]) * 1000)
+        if len(p["step"]) >= 50:
+            n = len(p["step"])
+            avg = lambda k: sum(p[k]) / len(p[k]) if p[k] else 0  # noqa: E731
+            bsz_avg = avg("bsz")
+            logger.info(
+                "[STEP_PROF] n=%d bsz=%.1f step=%.2fms fwd=%.2fms mtp=%.2fms "
+                "gap=%.2fms overhead=%.2fms | "
+                "bookkeep=%.2fms d2h_launch=%.2fms postproc=%.2fms "
+                "d2h_sync=%.2fms pooler=%.2fms",
+                n, bsz_avg, avg("step"), avg("fwd"), avg("mtp"),
+                avg("gap"),
+                avg("step") - avg("fwd") - avg("mtp"),
+                avg("st_bookkeep"), avg("st_d2h_launch"),
+                avg("st_postproc"), avg("st_d2h_sync"), avg("st_pooler"),
+            )
+            for k in ("step", "fwd", "mtp", "bsz", "gap",
+                       "st_bookkeep", "st_d2h_launch", "st_postproc",
+                       "st_d2h_sync", "st_pooler"):
+                p[k].clear()
 
         return None
 
@@ -519,6 +554,7 @@ class GPUARModelRunner(OmniGPUModelRunner):
             else:
                 propose_drafts_after_bookkeeping = input_fits_in_drafter
 
+        _t_st = _time.perf_counter()
         with record_function_or_nullcontext("gpu_model_runner: bookkeep"):
             (
                 num_nans_in_logits,
@@ -536,33 +572,27 @@ class GPUARModelRunner(OmniGPUModelRunner):
                 scheduler_output.total_num_scheduled_tokens,
                 spec_decode_metadata,
             )
+        _t_bookkeep = _time.perf_counter()
 
         if propose_drafts_after_bookkeeping:
-            # ngram and other speculative decoding methods use the sampled
-            # tokens on the CPU, so they are run after bookkeeping.
             propose_draft_token_ids(valid_sampled_token_ids)
 
-        # Finalize KV connector (wait_for_save + clear metadata) after
-        # draft model runs. Deferred from target model forward to allow
-        # draft model to also save its KV cache.
         if self.speculative_config is not None:
             self.finalize_kv_connector()
 
         with record_function_or_nullcontext("gpu_model_runner: eplb"):
             self.eplb_step()
 
-        # kv_connector_output may be modified during drafting
         kv_connector_output = self.kv_connector_output
         self.kv_connector_output = None
 
-        # Launch async D2H copy on a dedicated stream so that the GPU can
-        # continue running _process_additional_information_updates in parallel.
         hs_len = hidden_states.shape[0]
         hs_pinned = self._hidden_states_pinned[:hs_len]
         self._d2h_stream.wait_stream(torch.cuda.current_stream())
         with torch.cuda.stream(self._d2h_stream):
             hs_pinned.copy_(hidden_states.detach(), non_blocking=True)
         self._d2h_event.record(self._d2h_stream)
+        _t_d2h_launch = _time.perf_counter()
 
         num_scheduled_tokens_np = getattr(self, "_omni_num_scheduled_tokens_np", None)
         if num_scheduled_tokens_np is None:
@@ -575,13 +605,12 @@ class GPUARModelRunner(OmniGPUModelRunner):
         self._process_additional_information_updates(
             hidden_states, multimodal_outputs, num_scheduled_tokens_np, scheduler_output
         )
+        _t_postprocess = _time.perf_counter()
 
-        # Sync the async D2H before accessing CPU hidden states.
         self._d2h_event.synchronize()
         hidden_states_cpu = hs_pinned
+        _t_d2h_sync = _time.perf_counter()
 
-        # Pre-copy multimodal tensors to CPU once (not per-request) to avoid
-        # redundant D2H transfers when gpu_resident_buffer_keys keeps them on GPU.
         mm_cpu: dict[str, object] = {}
         if isinstance(multimodal_outputs, dict) and multimodal_outputs:
             for k, v in multimodal_outputs.items():
@@ -625,18 +654,24 @@ class GPUARModelRunner(OmniGPUModelRunner):
                         mm_payload[k] = {sk: sv[start:end].contiguous() for sk, sv in v.items()}
                     elif isinstance(v, list):
                         element = v[idx] if idx < len(v) else v[0]
-                        # Clone tensors to avoid cross-request aliasing
                         if isinstance(element, torch.Tensor):
                             element = element.clone()
                         mm_payload[k] = element
                     elif isinstance(v, torch.Tensor):
-                        # List-derived tensor payloads are request-invariant; clone to
-                        # avoid accidental cross-request aliasing on downstream mutation.
                         mm_payload[k] = v.clone()
                     else:
                         mm_payload[k] = v
                 payload.update(mm_payload)
             pooler_output.append(payload)
+        _t_pooler = _time.perf_counter()
+
+        if hasattr(self, "_prof"):
+            _sp = self._prof
+            _sp.setdefault("st_bookkeep", []).append((_t_bookkeep - _t_st) * 1000)
+            _sp.setdefault("st_d2h_launch", []).append((_t_d2h_launch - _t_bookkeep) * 1000)
+            _sp.setdefault("st_postproc", []).append((_t_postprocess - _t_d2h_launch) * 1000)
+            _sp.setdefault("st_d2h_sync", []).append((_t_d2h_sync - _t_postprocess) * 1000)
+            _sp.setdefault("st_pooler", []).append((_t_pooler - _t_d2h_sync) * 1000)
         with record_function_or_nullcontext("gpu_model_runner: ModelRunnerOutput"):
             if self.routed_experts_initialized:
                 capturer = RoutedExpertsCapturer.get_instance()
@@ -658,6 +693,8 @@ class GPUARModelRunner(OmniGPUModelRunner):
             )
             output.kv_extracted_req_ids = kv_extracted_req_ids
 
+        if hasattr(self, "_prof"):
+            self._prof["last_end"] = _time.perf_counter()
         if not self.use_async_scheduling:
             return output
         with record_function_or_nullcontext("gpu_model_runner: AsyncGPUModelRunnerOutput"):

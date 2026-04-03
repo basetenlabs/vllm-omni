@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import time as _time_mod
 from collections import defaultdict
 from dataclasses import asdict, dataclass
 from time import time
@@ -148,26 +149,24 @@ class OmniARScheduler(VLLMScheduler):
         return False
 
     def schedule(self) -> SchedulerOutput:  # type: ignore[override]
+        _t0 = _time_mod.perf_counter()
         if self.chunk_transfer_adapter:
             self.chunk_transfer_adapter.process_pending_chunks(self.waiting, self.running)
+        _t1 = _time_mod.perf_counter()
 
         try:
             scheduler_output = super().schedule()
         finally:
             if self.chunk_transfer_adapter:
-                # Add request waiting for chunk to the waiting and running queue
                 self.chunk_transfer_adapter.restore_queues(self.waiting, self.running)
+        _t2 = _time_mod.perf_counter()
         try:
-            # Late import to avoid circulars in some launch modes
             from .output import OmniNewRequestData
 
-            # Rewrap base NewRequestData entries with OmniNewRequestData,
-            # enriching with request-level payloads
             new_list = []
             for nr in scheduler_output.scheduled_new_reqs:
                 req_id = getattr(nr, "req_id", None)
                 request = self.requests.get(req_id) if req_id else None
-                # Build omni entry preserving all base fields
                 omni_nr = OmniNewRequestData(
                     req_id=nr.req_id,
                     external_req_id=(getattr(request, "external_req_id", None) if request else None),
@@ -178,7 +177,6 @@ class OmniARScheduler(VLLMScheduler):
                     block_ids=nr.block_ids,
                     num_computed_tokens=nr.num_computed_tokens,
                     lora_request=nr.lora_request,
-                    # Enrich with omni payloads from the live request object
                     prompt_embeds=(getattr(request, "prompt_embeds", None) if request else None),
                     additional_information=(getattr(request, "additional_information", None) if request else None),
                 )
@@ -187,26 +185,46 @@ class OmniARScheduler(VLLMScheduler):
             scheduler_output.scheduled_new_reqs = new_list  # type: ignore[assignment]
             if self.chunk_transfer_adapter:
                 self.chunk_transfer_adapter.postprocess_scheduler_output(scheduler_output, self.requests)
-            # Add information about requests needing KV cache transfer
             finished_reqs = self.get_finished_requests_needing_kv_transfer()
         except Exception:
-            # If anything goes wrong, leave the original output unchanged
             init_logger(__name__).exception("Failed to wrap scheduled_new_reqs with OmniNewRequestData")
             finished_reqs = {}
+        _t3 = _time_mod.perf_counter()
 
-        # Wrap in omni scheduler output to carry transfer metadata.
         base_fields = SchedulerOutput.__dataclass_fields__.keys()
         base_data = {name: getattr(scheduler_output, name) for name in base_fields}
-        return OmniSchedulerOutput(
+        out = OmniSchedulerOutput(
             **base_data,
             finished_requests_needing_kv_transfer=finished_reqs,
         )
+
+        if not hasattr(self, "_sched_prof"):
+            self._sched_prof = {"chunks": [], "base": [], "wrap": [], "n": 0}
+        sp = self._sched_prof
+        sp["chunks"].append((_t1 - _t0) * 1000)
+        sp["base"].append((_t2 - _t1) * 1000)
+        sp["wrap"].append((_t3 - _t2) * 1000)
+        sp["n"] += 1
+        if sp["n"] >= 50:
+            avg = lambda k: sum(sp[k]) / len(sp[k])  # noqa: E731
+            logger.info(
+                "[SCHED_PROF] n=%d schedule: chunks=%.2fms base=%.2fms wrap=%.2fms total=%.2fms",
+                sp["n"], avg("chunks"), avg("base"), avg("wrap"),
+                avg("chunks") + avg("base") + avg("wrap"),
+            )
+            sp["chunks"].clear()
+            sp["base"].clear()
+            sp["wrap"].clear()
+            sp["n"] = 0
+
+        return out
 
     def update_from_output(
         self,
         scheduler_output: SchedulerOutput,
         model_runner_output: ModelRunnerOutput,
     ) -> dict[int, EngineCoreOutputs]:
+        _ufo_t0 = _time_mod.perf_counter()
         sampled_token_ids = model_runner_output.sampled_token_ids
         logprobs = model_runner_output.logprobs
         prompt_logprobs_dict = model_runner_output.prompt_logprobs_dict
@@ -505,6 +523,21 @@ class OmniARScheduler(VLLMScheduler):
                         self.waiting_for_transfer_free.remove(req_id)
         except Exception:
             init_logger(__name__).exception("Failed to process finished transfer requests")
+
+        _ufo_t1 = _time_mod.perf_counter()
+        if not hasattr(self, "_ufo_prof"):
+            self._ufo_prof = {"total": [], "n": 0}
+        up = self._ufo_prof
+        up["total"].append((_ufo_t1 - _ufo_t0) * 1000)
+        up["n"] += 1
+        if up["n"] >= 50:
+            avg_t = sum(up["total"]) / len(up["total"])
+            logger.info(
+                "[UFO_PROF] n=%d update_from_output: total=%.2fms  bsz=%d",
+                up["n"], avg_t, len(scheduler_output.num_scheduled_tokens),
+            )
+            up["total"].clear()
+            up["n"] = 0
 
         return engine_core_outputs
 

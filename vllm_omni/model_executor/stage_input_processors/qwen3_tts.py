@@ -146,8 +146,10 @@ def talker2code2wav_async_chunk(
     if isinstance(pooling_output, dict):
         frame = _extract_last_frame(pooling_output)
         if frame is not None:
-            codec_codes = frame.cpu().tolist()
-            transfer_manager.code_prompt_token_ids[request_id].append(codec_codes)
+            # Keep frames as CPU tensors to avoid per-step Python list work.
+            transfer_manager.code_prompt_token_ids[request_id].append(
+                frame.cpu().contiguous()
+            )
         ref_code = pooling_output.get("ref_code")
         if isinstance(ref_code, torch.Tensor) and ref_code.numel() > 0 and request_payload.get(request_id) is None:
             request_payload[request_id] = ref_code.to(torch.long).cpu().contiguous()
@@ -236,6 +238,7 @@ def talker2code2wav_async_chunk(
     end_index = min(length, left_context_size_config + context_length)
     left_context_size = max(0, end_index - context_length)
     window_frames = transfer_manager.code_prompt_token_ids[request_id][-end_index:]
+    window_tensor = torch.stack(window_frames)  # [F, Q]
 
     # Prepend ref_code as decoder context for every chunk so the vocoder
     # maintains voice-clone speaker identity throughout the stream.  The HF
@@ -245,13 +248,35 @@ def talker2code2wav_async_chunk(
     # subsequent chunks.
     ref_code = request_payload.get(request_id)
     if isinstance(ref_code, torch.Tensor) and ref_code.numel() > 0:
-        ref_frames = ref_code.tolist()
-        window_frames = ref_frames + window_frames
-        left_context_size += len(ref_frames)
+        ref_tensor = ref_code.to(torch.long).cpu().contiguous()
+        if ref_tensor.ndim == 1:
+            q = int(window_tensor.shape[1])
+            if q > 0 and ref_tensor.numel() % q == 0:
+                ref_tensor = ref_tensor.reshape(-1, q)
+            else:
+                logger.warning(
+                    "Ignoring malformed ref_code with %d elements not divisible by num_quantizers=%d",
+                    int(ref_tensor.numel()),
+                    q,
+                )
+                ref_tensor = None
+        elif ref_tensor.ndim != 2:
+            logger.warning("Ignoring malformed ref_code shape %s", tuple(ref_tensor.shape))
+            ref_tensor = None
 
-    num_quantizers = len(window_frames[0])
-    num_frames = len(window_frames)
-    code_predictor_codes = [window_frames[f][q] for q in range(num_quantizers) for f in range(num_frames)]
+        if isinstance(ref_tensor, torch.Tensor):
+            if int(ref_tensor.shape[1]) != int(window_tensor.shape[1]):
+                logger.warning(
+                    "Ignoring ref_code with incompatible quantizer dim %d (expected %d)",
+                    int(ref_tensor.shape[1]),
+                    int(window_tensor.shape[1]),
+                )
+            else:
+                left_context_size += int(ref_tensor.shape[0])
+                window_tensor = torch.cat([ref_tensor, window_tensor], dim=0)
+
+    # Code2Wav expects codebook-major flat: [Q * num_frames].
+    code_predictor_codes = window_tensor.transpose(0, 1).contiguous().reshape(-1).tolist()
 
     info: dict[str, Any] = {
         "code_predictor_codes": code_predictor_codes,

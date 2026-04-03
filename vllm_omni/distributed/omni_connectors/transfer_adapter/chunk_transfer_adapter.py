@@ -52,6 +52,7 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
         self.get_req_chunk: dict[str, int] = defaultdict(int)
         self.finished_requests: set[str] = set()
         self.request_payload = {}
+        # Per-request rolling codec frames; entries are 1-D CPU tensors [Q].
         self.code_prompt_token_ids: dict[str, list[torch.Tensor]] = defaultdict(list)
         self.request_ids_mapping: dict[str, str] = {}
 
@@ -213,7 +214,7 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
         external_req_id = request.external_req_id
         chunk_id = self.put_req_chunk[external_req_id]
         connector_put_key = f"{external_req_id}_{stage_id}_{chunk_id}"
-        # Process payload in save_loop thread
+
         payload_data = None
         if self.custom_process_next_stage_input_func:
             try:
@@ -223,11 +224,14 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
                     request=request,
                     is_finished=is_finished,
                 )
-
             except Exception as e:
-                logger.error(f"Failed to use custom_process_input_func for payload extraction: {e}")
+                logger.error(
+                    "Failed to use custom_process_input_func for "
+                    "payload extraction: %s", e)
 
         if not payload_data:
+            if is_finished:
+                self.cleanup_sender(external_req_id)
             return
 
         success, size, metadata = self.connector.put(
@@ -239,7 +243,7 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
 
         if success:
             self.put_req_chunk[external_req_id] += 1
-            logger.debug(f"[Stage-{stage_id}] Sent {connector_put_key}")
+            logger.debug("[Stage-%s] Sent %s", stage_id, connector_put_key)
 
         if is_finished:
             self.cleanup_sender(external_req_id)

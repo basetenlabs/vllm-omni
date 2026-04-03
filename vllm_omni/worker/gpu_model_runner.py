@@ -1252,7 +1252,11 @@ class OmniGPUModelRunner(GPUModelRunner):
 
             # run talker mtp decode
             if self.has_talker_mtp:
+                _t0_mtp = __import__('time').perf_counter()
                 self._talker_mtp_forward(decode_req_ids, inputs_embeds)
+                _mtp_ms = (__import__('time').perf_counter() - _t0_mtp) * 1000
+                if hasattr(self, '_prof'):
+                    self._prof["mtp"].append(_mtp_ms)
 
         return (
             input_ids,
