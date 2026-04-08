@@ -314,9 +314,7 @@ def build_engine_args_dict(
     if stage_type != "diffusion":
         resolve_worker_cls(engine_args_dict)
 
-    engine_args_dict.setdefault(
-        "distributed_executor_backend", _default_executor_backend(engine_args_dict)
-    )
+    engine_args_dict.setdefault("distributed_executor_backend", _default_executor_backend(engine_args_dict))
 
     return engine_args_dict
 
