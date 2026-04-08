@@ -8,6 +8,7 @@
 #   ./run_server.sh Base 0.6B                          # 0.6B Base (voice clone)
 #   ./run_server.sh /path/to/local/model               # Local model directory
 #   SERVED_MODEL_NAME=my-tts ./run_server.sh           # Custom served model name
+#   STAGE_CONFIGS_PATH=/path/to/config.yaml ./run_server.sh  # Custom stage config
 
 set -e
 
@@ -39,11 +40,12 @@ else
 fi
 
 SERVED_MODEL_NAME="${SERVED_MODEL_NAME:-}"
+STAGE_CONFIGS_PATH="${STAGE_CONFIGS_PATH:-vllm_omni/model_executor/stage_configs/qwen3_tts.yaml}"
 
 echo "Starting Qwen3-TTS server with model: $MODEL"
 
 SERVE_ARGS=(
-    --stage-configs-path benchmarks/qwen3-tts/vllm_omni/configs/qwen3_tts_bs32.yaml
+    --stage-configs-path "$STAGE_CONFIGS_PATH"
     --host 0.0.0.0
     --port 8091
     --gpu-memory-utilization 0.9
