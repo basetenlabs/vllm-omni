@@ -2,13 +2,13 @@
 # Launch vLLM-Omni server for Qwen3-TTS models
 #
 # Usage:
-#   ./run_server.sh                                    # Default: 1.7B CustomVoice
-#   ./run_server.sh CustomVoice                        # 1.7B CustomVoice
-#   ./run_server.sh VoiceDesign 1.7B                   # 1.7B VoiceDesign
-#   ./run_server.sh Base 0.6B                          # 0.6B Base (voice clone)
-#   ./run_server.sh /path/to/local/model               # Local model directory
-#   SERVED_MODEL_NAME=my-tts ./run_server.sh           # Custom served model name
-#   STAGE_CONFIGS_PATH=/path/to/config.yaml ./run_server.sh  # Custom stage config
+#   ./run_server.sh                                                        # Default: 1.7B CustomVoice
+#   ./run_server.sh CustomVoice                                            # 1.7B CustomVoice
+#   ./run_server.sh VoiceDesign 1.7B                                       # 1.7B VoiceDesign
+#   ./run_server.sh Base 0.6B                                              # 0.6B Base (voice clone)
+#   ./run_server.sh /path/to/local/model                                   # Local model directory
+#   SERVED_MODEL_NAME=my-tts ./run_server.sh                               # Custom served model name
+#   STAGE_CONFIGS_PATH=./my_qwen_stage_config.yaml ./run_server.sh         # Custom stage config
 
 set -e
 
