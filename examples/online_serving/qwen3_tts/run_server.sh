@@ -2,8 +2,8 @@
 # Launch vLLM-Omni server for Qwen3-TTS models
 #
 # Usage:
-#   ./run_server.sh                                    # Default: 0.6B CustomVoice
-#   ./run_server.sh CustomVoice                        # 0.6B CustomVoice
+#   ./run_server.sh                                    # Default: 1.7B CustomVoice
+#   ./run_server.sh CustomVoice                        # 1.7B CustomVoice
 #   ./run_server.sh VoiceDesign 1.7B                   # 1.7B VoiceDesign
 #   ./run_server.sh Base 0.6B                          # 0.6B Base (voice clone)
 #   ./run_server.sh /path/to/local/model               # Local model directory
@@ -12,7 +12,7 @@
 set -e
 
 ARG="${1:-CustomVoice}"
-SIZE="${2:-0.6B}"
+SIZE="${2:-1.7B}"
 
 if [ -d "$ARG" ]; then
     MODEL="$ARG"
@@ -43,7 +43,7 @@ SERVED_MODEL_NAME="${SERVED_MODEL_NAME:-}"
 echo "Starting Qwen3-TTS server with model: $MODEL"
 
 SERVE_ARGS=(
-    --stage-configs-path vllm_omni/model_executor/stage_configs/qwen3_tts.yaml
+    --stage-configs-path benchmarks/qwen3-tts/vllm_omni/configs/qwen3_tts_bs32.yaml
     --host 0.0.0.0
     --port 8091
     --gpu-memory-utilization 0.9
