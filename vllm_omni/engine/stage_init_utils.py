@@ -277,21 +277,6 @@ def setup_stage_devices(stage_id: int, runtime_cfg: Any) -> None:
         )
 
 
-def _default_executor_backend(engine_args_dict: dict[str, Any]) -> str:
-    """Return the distributed executor backend appropriate for the world size.
-
-    Single-GPU stages benefit from the lightweight ``uni`` (UniProcExecutor)
-    backend which avoids unnecessary multiprocessing overhead.  Multi-GPU
-    stages need ``mp`` (MultiprocExecutor) for inter-process communication.
-
-    Note: The UniProcExecutor backend is only supported when world size is 1
-    """
-    tp = engine_args_dict.get("tensor_parallel_size", 1)
-    pp = engine_args_dict.get("pipeline_parallel_size", 1)
-    world_size = tp * pp
-    return "uni" if world_size == 1 else "mp"
-
-
 def build_engine_args_dict(
     stage_config: Any,
     model: str,
@@ -313,8 +298,6 @@ def build_engine_args_dict(
 
     if stage_type != "diffusion":
         resolve_worker_cls(engine_args_dict)
-
-    engine_args_dict.setdefault("distributed_executor_backend", _default_executor_backend(engine_args_dict))
 
     return engine_args_dict
 
