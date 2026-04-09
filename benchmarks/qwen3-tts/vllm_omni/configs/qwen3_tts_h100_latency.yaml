@@ -1,0 +1,103 @@
+# Qwen3-TTS H100 80GB — LATENCY-OPTIMIZED (high concurrency)
+# Goal: minimize TTFP and E2E latency while sustaining high concurrent load
+# Trade-off: lower peak throughput vs throughput-optimized config
+#
+# Key changes vs baseline (bs16_uni_base):
+#   - max_num_seqs 10/1→24/24: high concurrency with headroom for backpressure
+#   - gpu_memory_utilization 0.3/0.3→0.70/0.25: rebalance toward AR Talker;
+#     extra KV cache eliminates preemption at high concurrency
+#   - codec_chunk_frames 25→25: balanced chunk size (25+72=97 frames per decode,
+#     26% useful work vs 12% at chunk=10)
+#   - codec_left_context_frames→72: match decoder sliding attention window for quality
+#   - connector_get_max_wait 300→150: fail-fast on stalled requests
+#   - max_inflight 1→24: match max_num_seqs
+async_chunk: true
+stage_args:
+  - stage_id: 0
+    stage_type: llm
+    is_comprehension: true
+    runtime:
+      devices: "0"
+    engine_args:
+      max_num_seqs: 24
+      model_stage: qwen3_tts
+      model_arch: Qwen3TTSTalkerForConditionalGeneration
+      worker_type: ar
+      scheduler_cls: vllm_omni.core.sched.omni_ar_scheduler.OmniARScheduler
+      enforce_eager: false
+      trust_remote_code: true
+      async_scheduling: true
+      enable_prefix_caching: false
+      engine_output_type: latent
+      gpu_memory_utilization: 0.70
+      max_num_batched_tokens: 12288
+      max_model_len: 4096
+      custom_process_next_stage_input_func: vllm_omni.model_executor.stage_input_processors.qwen3_tts.talker2code2wav_async_chunk
+    output_connectors:
+      to_stage_1: connector_of_shared_memory
+    default_sampling_params:
+      temperature: 0.9
+      top_k: 50
+      max_tokens: 4096
+      seed: 42
+      detokenize: false
+      repetition_penalty: 1.05
+      stop_token_ids: [2150]
+
+  - stage_id: 1
+    stage_type: llm
+    runtime:
+      devices: "0"
+    engine_args:
+      max_num_seqs: 24
+      model_stage: code2wav
+      model_arch: Qwen3TTSCode2Wav
+      worker_type: generation
+      scheduler_cls: vllm_omni.core.sched.omni_generation_scheduler.OmniGenerationScheduler
+      enforce_eager: true
+      trust_remote_code: true
+      async_scheduling: true
+      enable_prefix_caching: false
+      engine_output_type: audio
+      gpu_memory_utilization: 0.25
+      max_num_batched_tokens: 65536
+      max_model_len: 65536
+    engine_input_source: [0]
+    final_output: true
+    final_output_type: audio
+    input_connectors:
+      from_stage_0: connector_of_shared_memory
+    tts_args:
+      max_instructions_length: 500
+    default_sampling_params:
+      temperature: 0.0
+      top_p: 1.0
+      top_k: -1
+      max_tokens: 65536
+      seed: 42
+      detokenize: true
+      repetition_penalty: 1.0
+
+runtime:
+  enabled: true
+  defaults:
+    window_size: -1
+    max_inflight: 24
+
+  connectors:
+    connector_of_shared_memory:
+      name: SharedMemoryConnector
+      extra:
+        shm_threshold_bytes: 65536
+        codec_streaming: true
+        connector_get_sleep_s: 0.01
+        connector_get_max_wait_first_chunk: 2000
+        connector_get_max_wait: 150
+        codec_chunk_frames: 25
+        # Match the decoder sliding attention window for quality
+        codec_left_context_frames: 72
+
+  edges:
+    - from: 0
+      to: 1
+      window_size: -1
