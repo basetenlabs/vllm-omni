@@ -37,8 +37,14 @@ PROMPTS = [
     "Could you please turn down the music a little bit, I'm trying to concentrate on my work.",
     "It was a dark and stormy night when the old lighthouse keeper heard a knock at the door.",
 ]
-REF_AUDIO = "https://qianwen-res.oss-cn-beijing.aliyuncs.com/Qwen3-TTS-Repo/clone_2.wav"
-REF_TEXT = "Okay. Yeah. I resent you. I love you. I respect you. But you know what? You blew it! And thanks to you."
+
+VOICES = {
+    "clone_2": {
+        "ref_audio": "https://qianwen-res.oss-cn-beijing.aliyuncs.com/Qwen3-TTS-Repo/clone_2.wav",
+        "ref_text": "Okay. Yeah. I resent you. I love you. I respect you. But you know what? You blew it! And thanks to you.",
+    },
+}
+
 INSTRUCT = "Speak in an incredulous tone, but with a hint of panic beginning to creep into your voice."
 
 
@@ -97,7 +103,11 @@ def pcm_bytes_to_duration(num_bytes: int, sample_rate: int = 24000, sample_width
 
 
 def create_payload(
-    prompt: str, task_type: str = "CustomVoice", voice: str = "vivian", language: str = "English"
+    prompt: str,
+    task_type: str = "CustomVoice",
+    voice: str = "vivian",
+    language: str = "English",
+    include_ref_audio: bool = False,
 ) -> dict:
     payload = {
         "input": prompt,
@@ -108,8 +118,11 @@ def create_payload(
     }
 
     if task_type == "Base":
-        payload["ref_audio"] = REF_AUDIO
-        payload["ref_text"] = REF_TEXT
+        if include_ref_audio and voice in VOICES:
+            payload["ref_audio"] = VOICES[voice]["ref_audio"]
+            payload["ref_text"] = VOICES[voice]["ref_text"]
+        else:
+            payload["voice"] = voice
     elif task_type == "CustomVoice":
         payload["voice"] = voice
     elif task_type == "VoiceDesign":
@@ -125,10 +138,11 @@ async def send_tts_request(
     task_type: str = "CustomVoice",
     voice: str = "vivian",
     language: str = "English",
+    include_ref_audio: bool = False,
     pbar: tqdm | None = None,
 ) -> RequestResult:
     """Send a streaming TTS request and measure latency metrics."""
-    payload = create_payload(prompt, task_type, voice, language)
+    payload = create_payload(prompt, task_type, voice, language, include_ref_audio=include_ref_audio)
 
     result = RequestResult(prompt=prompt)
     st = time.perf_counter()
@@ -167,6 +181,58 @@ async def send_tts_request(
     return result
 
 
+async def upload_voice_to_server(
+    session: aiohttp.ClientSession,
+    base_url: str,
+    voice_name: str,
+) -> bool:
+    """Upload a voice to the server so benchmark requests can reference it by name.
+
+    Downloads the ref_audio locally, then POSTs it to /v1/audio/voices.
+    Returns True if the voice is ready to use.
+    """
+    voice_cfg = VOICES.get(voice_name)
+    if not voice_cfg:
+        return False
+
+    voices_url = f"{base_url}/v1/audio/voices"
+
+    # Check if voice already exists
+    async with session.get(voices_url) as resp:
+        if resp.status == 200:
+            data = await resp.json()
+            existing = {v.lower() for v in data.get("voices", [])}
+            if voice_name.lower() in existing:
+                print(f"  Voice '{voice_name}' already exists on server, skipping upload.")
+                return True
+
+    # Download the ref audio
+    print(f"  Downloading ref audio for voice '{voice_name}'...")
+    async with session.get(voice_cfg["ref_audio"]) as resp:
+        if resp.status != 200:
+            print(f"  Failed to download ref audio: HTTP {resp.status}")
+            return False
+        audio_bytes = await resp.read()
+
+    # Upload to the server
+    print(f"  Uploading voice '{voice_name}' to server...")
+    form = aiohttp.FormData()
+    form.add_field("audio_sample", audio_bytes, filename=f"{voice_name}.wav", content_type="audio/wav")
+    form.add_field("consent", "agreed")
+    form.add_field("name", voice_name)
+    if voice_cfg.get("ref_text"):
+        form.add_field("ref_text", voice_cfg["ref_text"])
+
+    async with session.post(voices_url, data=form) as resp:
+        if resp.status == 200:
+            print(f"  Voice '{voice_name}' uploaded successfully.")
+            return True
+        else:
+            text = await resp.text()
+            print(f"  Voice upload failed: HTTP {resp.status}: {text[:200]}")
+            return False
+
+
 async def run_benchmark(
     host: str,
     port: int,
@@ -178,7 +244,8 @@ async def run_benchmark(
     language: str = "English",
 ) -> BenchmarkResult:
     """Run benchmark at a given concurrency level."""
-    api_url = f"http://{host}:{port}/v1/audio/speech"
+    base_url = f"http://{host}:{port}"
+    api_url = f"{base_url}/v1/audio/speech"
 
     connector = aiohttp.TCPConnector(
         limit=max_concurrency,
@@ -190,13 +257,21 @@ async def run_benchmark(
         timeout=aiohttp.ClientTimeout(total=600),
     )
 
-    # Warmup
+    # Upload voice if using Base task with a known voice config
+    if task_type == "Base" and voice in VOICES:
+        uploaded = await upload_voice_to_server(session, base_url, voice)
+        if not uploaded:
+            print(f"  WARNING: Could not upload voice '{voice}', falling back to sending ref_audio per request.")
+
+    # Warmup (send ref_audio on warmup to prime any remaining caches)
     if num_warmups > 0:
         print(f"  Warming up with {num_warmups} requests...")
         warmup_tasks = []
         for i in range(num_warmups):
             prompt = PROMPTS[i % len(PROMPTS)]
-            warmup_tasks.append(send_tts_request(session, api_url, prompt, task_type, voice, language))
+            warmup_tasks.append(
+                send_tts_request(session, api_url, prompt, task_type, voice, language, include_ref_audio=True)
+            )
         await asyncio.gather(*warmup_tasks)
         print("  Warmup done.")
 
@@ -210,7 +285,7 @@ async def run_benchmark(
 
     async def limited_request(prompt):
         async with semaphore:
-            return await send_tts_request(session, api_url, prompt, task_type, voice, language, pbar)
+            return await send_tts_request(session, api_url, prompt, task_type, voice, language, pbar=pbar)
 
     start_time = time.perf_counter()
     tasks = [asyncio.create_task(limited_request(p)) for p in request_prompts]
@@ -356,8 +431,8 @@ def parse_args():
         "--max-concurrency", type=int, nargs="+", default=[1, 4, 10], help="Concurrency levels to test"
     )
     parser.add_argument("--num-warmups", type=int, default=3)
-    parser.add_argument("--task-type", type=str, default="CustomVoice", choices=["CustomVoice", "VoiceDesign", "Base"])
-    parser.add_argument("--voice", type=str, default="vivian")
+    parser.add_argument("--task-type", type=str, default="Base", choices=["CustomVoice", "VoiceDesign", "Base"])
+    parser.add_argument("--voice", type=str, default="clone_2", help="Voice name (must exist in VOICES dict for Base task)")
     parser.add_argument("--language", type=str, default="English")
     parser.add_argument(
         "--config-name", type=str, default="async_chunk", help="Label for this config (used in filenames)"
