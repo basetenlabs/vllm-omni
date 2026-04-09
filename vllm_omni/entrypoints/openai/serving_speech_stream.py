@@ -4,25 +4,53 @@ Accepts text incrementally via WebSocket, buffers and splits at sentence
 boundaries, and generates audio per sentence using the existing TTS pipeline.
 
 Protocol:
-    Client -> Server:
+    Client -> Server (TTS flow):
         {"type": "session.config", ...}   # Session config (sent once first)
         {"type": "input.text", "text": "..."} # Text chunks
         {"type": "input.done"}            # End of input
 
-    Server -> Client:
+    Client -> Server (voice management — usable at any time):
+        {"type": "voice.list"}
+        {"type": "voice.add", "name": "...", "consent": "...", ...}
+        {"type": "voice.remove", "name": "..."}
+
+    Server -> Client (TTS responses):
         {"type": "audio.start", "sentence_index": 0, "sentence_text": "...", "format": "wav"}
         <binary frame: audio bytes>
         {"type": "audio.done", "sentence_index": 0}
         {"type": "session.done", "total_sentences": N}
         {"type": "error", "message": "..."}
+
+    Server -> Client (voice management responses):
+        {"type": "voice.list.result", "voices": [...], "uploaded_voices": [...]}
+        {"type": "voice.add.result", "success": true, "voice": {...}}
+        {"type": "voice.remove.result", "success": true, "name": "..."}
+
+Voice management messages:
+    voice.list: No additional fields required.
+
+    voice.add: Accepts either audio or a pre-computed speaker embedding.
+        With audio (base64):
+            {"type": "voice.add", "name": "...", "consent": "...",
+             "audio_data": "<base64>", "audio_format": "wav",
+             "ref_text": "...", "speaker_description": "..."}
+        With embedding:
+            {"type": "voice.add", "name": "...", "consent": "...",
+             "speaker_embedding": [0.1, 0.2, ...]}
+
+    voice.remove:
+        {"type": "voice.remove", "name": "..."}
 """
 
 import asyncio
+import base64
+import io
 import json
 from contextlib import aclosing
 
 from fastapi import WebSocket, WebSocketDisconnect
 from pydantic import ValidationError
+from starlette.datastructures import Headers, UploadFile
 from vllm.logger import init_logger
 
 from vllm_omni.entrypoints.openai.protocol.audio import (
@@ -43,6 +71,17 @@ _DEFAULT_CONFIG_TIMEOUT = 10.0  # seconds
 _PCM_SAMPLE_RATE = 24000
 _MAX_CONFIG_MESSAGE_SIZE = 4 * 1024 * 1024  # allow large ref_audio payloads
 _MAX_INPUT_TEXT_MESSAGE_SIZE = 128 * 1024
+_MAX_VOICE_ADD_MESSAGE_SIZE = 16 * 1024 * 1024  # 16 MiB for base64 audio (~12 MB raw)
+_VOICE_MSG_TYPES = frozenset({"voice.list", "voice.add", "voice.remove"})
+_MIME_FROM_FORMAT = {
+    "wav": "audio/wav",
+    "mp3": "audio/mpeg",
+    "flac": "audio/flac",
+    "ogg": "audio/ogg",
+    "aac": "audio/aac",
+    "webm": "audio/webm",
+    "mp4": "audio/mp4",
+}
 
 
 class OmniStreamingSpeechHandler:
@@ -92,7 +131,7 @@ class OmniStreamingSpeechHandler:
             splitter = SentenceSplitter(boundary_re=boundary_re)
             sentence_index = 0
 
-            # 2. Receive text chunks until input.done
+            # 2. Receive text chunks until input.done (voice.* also accepted)
             while True:
                 try:
                     raw = await asyncio.wait_for(
@@ -102,10 +141,6 @@ class OmniStreamingSpeechHandler:
                 except asyncio.TimeoutError:
                     await self._send_error(websocket, "Idle timeout: no message received")
                     return
-
-                if len(raw) > _MAX_INPUT_TEXT_MESSAGE_SIZE:
-                    await self._send_error(websocket, "input.text message too large")
-                    continue
 
                 try:
                     msg = json.loads(raw)
@@ -120,6 +155,9 @@ class OmniStreamingSpeechHandler:
                 msg_type = msg.get("type")
 
                 if msg_type == "input.text":
+                    if len(raw) > _MAX_INPUT_TEXT_MESSAGE_SIZE:
+                        await self._send_error(websocket, "input.text message too large")
+                        continue
                     text = msg.get("text", "")
                     if not isinstance(text, str):
                         await self._send_error(websocket, "input.text requires a string value")
@@ -130,13 +168,11 @@ class OmniStreamingSpeechHandler:
                         sentence_index += 1
 
                 elif msg_type == "input.done":
-                    # Flush remaining buffer
                     remaining = splitter.flush()
                     if remaining:
                         await self._generate_and_send(websocket, config, remaining, sentence_index)
                         sentence_index += 1
 
-                    # Send session.done
                     await websocket.send_json(
                         {
                             "type": "session.done",
@@ -144,6 +180,12 @@ class OmniStreamingSpeechHandler:
                         }
                     )
                     return
+
+                elif msg_type in _VOICE_MSG_TYPES:
+                    if msg_type == "voice.add" and len(raw) > _MAX_VOICE_ADD_MESSAGE_SIZE:
+                        await self._send_error(websocket, "voice.add message too large")
+                        continue
+                    await self._handle_voice_message(websocket, msg)
 
                 else:
                     await self._send_error(
@@ -161,44 +203,67 @@ class OmniStreamingSpeechHandler:
                 logger.debug("Failed to send error to streaming speech client", exc_info=True)
 
     async def _receive_config(self, websocket: WebSocket) -> StreamingSpeechSessionConfig | None:
-        """Wait for and validate the session.config message."""
-        try:
-            raw = await asyncio.wait_for(
-                websocket.receive_text(),
-                timeout=self._config_timeout,
-            )
-        except asyncio.TimeoutError:
-            await self._send_error(websocket, "Timeout waiting for session.config")
-            return None
+        """Wait for and validate the session.config message.
 
-        if len(raw) > _MAX_CONFIG_MESSAGE_SIZE:
-            await self._send_error(websocket, "session.config message too large")
-            return None
+        Voice management messages (voice.*) are handled inline while waiting
+        for the config, so clients can manage voices before starting TTS.
+        """
+        loop = asyncio.get_event_loop()
+        deadline = loop.time() + self._config_timeout
 
-        try:
-            msg = json.loads(raw)
-        except json.JSONDecodeError:
-            await self._send_error(websocket, "Invalid JSON in session.config")
-            return None
+        while True:
+            remaining = deadline - loop.time()
+            if remaining <= 0:
+                await self._send_error(websocket, "Timeout waiting for session.config")
+                return None
 
-        if not isinstance(msg, dict):
-            await self._send_error(websocket, "session.config must be a JSON object")
-            return None
+            try:
+                raw = await asyncio.wait_for(
+                    websocket.receive_text(),
+                    timeout=remaining,
+                )
+            except asyncio.TimeoutError:
+                await self._send_error(websocket, "Timeout waiting for session.config")
+                return None
 
-        if msg.get("type") != "session.config":
-            await self._send_error(
-                websocket,
-                f"Expected session.config, got: {msg.get('type')}",
-            )
-            return None
+            max_size = _MAX_CONFIG_MESSAGE_SIZE
+            try:
+                msg = json.loads(raw)
+            except json.JSONDecodeError:
+                await self._send_error(websocket, "Invalid JSON")
+                continue
 
-        try:
-            config = StreamingSpeechSessionConfig(**{k: v for k, v in msg.items() if k != "type"})
-        except ValidationError as e:
-            await self._send_error(websocket, f"Invalid session config: {e}")
-            return None
+            if not isinstance(msg, dict):
+                await self._send_error(websocket, "Messages must be JSON objects")
+                continue
 
-        return config
+            msg_type = msg.get("type")
+
+            if msg_type in _VOICE_MSG_TYPES:
+                if msg_type == "voice.add" and len(raw) > _MAX_VOICE_ADD_MESSAGE_SIZE:
+                    await self._send_error(websocket, "voice.add message too large")
+                    continue
+                await self._handle_voice_message(websocket, msg)
+                continue
+
+            if len(raw) > max_size:
+                await self._send_error(websocket, "session.config message too large")
+                return None
+
+            if msg_type != "session.config":
+                await self._send_error(
+                    websocket,
+                    f"Expected session.config or voice.*, got: {msg_type}",
+                )
+                return None
+
+            try:
+                config = StreamingSpeechSessionConfig(**{k: v for k, v in msg.items() if k != "type"})
+            except ValidationError as e:
+                await self._send_error(websocket, f"Invalid session config: {e}")
+                return None
+
+            return config
 
     async def _generate_and_send(
         self,
@@ -275,6 +340,149 @@ class OmniStreamingSpeechHandler:
                 )
             except Exception:
                 logger.debug("Failed to send audio.done for sentence %d", sentence_index, exc_info=True)
+
+    # ------------------------------------------------------------------
+    # Voice management
+    # ------------------------------------------------------------------
+
+    async def _handle_voice_message(self, websocket: WebSocket, msg: dict) -> None:
+        """Dispatch a voice.* message to the appropriate handler."""
+        msg_type = msg["type"]
+        if msg_type == "voice.list":
+            await self._handle_voice_list(websocket)
+        elif msg_type == "voice.add":
+            await self._handle_voice_add(websocket, msg)
+        elif msg_type == "voice.remove":
+            await self._handle_voice_remove(websocket, msg)
+
+    async def _handle_voice_list(self, websocket: WebSocket) -> None:
+        """Return all available voices (built-in + uploaded)."""
+        svc = self._speech_service
+        voices = sorted(svc.supported_speakers) if svc.supported_speakers else []
+
+        uploaded_voices: list[dict] = []
+        for voice_name, info in getattr(svc, "uploaded_speakers", {}).items():
+            entry: dict = {
+                "name": info.get("name", voice_name),
+                "consent": info.get("consent", ""),
+                "created_at": info.get("created_at", 0),
+                "file_size": info.get("file_size", 0),
+                "mime_type": info.get("mime_type", ""),
+                "embedding_source": info.get("embedding_source", "audio"),
+                "embedding_dim": info.get("embedding_dim"),
+            }
+            if info.get("ref_text"):
+                entry["ref_text"] = info["ref_text"]
+            if info.get("speaker_description"):
+                entry["speaker_description"] = info["speaker_description"]
+            uploaded_voices.append(entry)
+
+        await websocket.send_json({
+            "type": "voice.list.result",
+            "voices": voices,
+            "uploaded_voices": uploaded_voices,
+        })
+
+    async def _handle_voice_add(self, websocket: WebSocket, msg: dict) -> None:
+        """Add a voice from base64 audio or a speaker embedding vector."""
+        name = msg.get("name")
+        consent = msg.get("consent")
+        if not name or not isinstance(name, str):
+            await self._send_error(websocket, "voice.add requires a 'name' string")
+            return
+        if not consent or not isinstance(consent, str):
+            await self._send_error(websocket, "voice.add requires a 'consent' string")
+            return
+
+        speaker_embedding = msg.get("speaker_embedding")
+        audio_data = msg.get("audio_data")
+
+        if speaker_embedding is not None and audio_data is not None:
+            await self._send_error(
+                websocket,
+                "voice.add: 'audio_data' and 'speaker_embedding' are mutually exclusive",
+            )
+            return
+        if speaker_embedding is None and audio_data is None:
+            await self._send_error(
+                websocket,
+                "voice.add requires either 'audio_data' (base64) or 'speaker_embedding'",
+            )
+            return
+
+        svc = self._speech_service
+        try:
+            if speaker_embedding is not None:
+                embedding_json = (
+                    json.dumps(speaker_embedding)
+                    if isinstance(speaker_embedding, list)
+                    else speaker_embedding
+                )
+                result = await svc.upload_voice_embedding(embedding_json, consent, name)
+            else:
+                audio_bytes = base64.b64decode(audio_data)
+                audio_format = msg.get("audio_format", "wav")
+                content_type = _MIME_FROM_FORMAT.get(audio_format, "application/octet-stream")
+                upload_file = UploadFile(
+                    file=io.BytesIO(audio_bytes),
+                    size=len(audio_bytes),
+                    filename=f"{name}.{audio_format}",
+                    headers=Headers({"content-type": content_type}),
+                )
+                result = await svc.upload_voice(
+                    upload_file,
+                    consent,
+                    name,
+                    ref_text=msg.get("ref_text"),
+                    speaker_description=msg.get("speaker_description"),
+                )
+
+            await websocket.send_json({
+                "type": "voice.add.result",
+                "success": True,
+                "voice": result,
+            })
+        except ValueError as exc:
+            await websocket.send_json({
+                "type": "voice.add.result",
+                "success": False,
+                "error": str(exc),
+            })
+        except Exception as exc:
+            logger.error("voice.add failed for '%s': %s", name, exc)
+            await websocket.send_json({
+                "type": "voice.add.result",
+                "success": False,
+                "error": f"Failed to add voice: {exc}",
+            })
+
+    async def _handle_voice_remove(self, websocket: WebSocket, msg: dict) -> None:
+        """Remove an uploaded voice by name."""
+        name = msg.get("name")
+        if not name or not isinstance(name, str):
+            await self._send_error(websocket, "voice.remove requires a 'name' string")
+            return
+
+        try:
+            success = await self._speech_service.delete_voice(name)
+            payload: dict = {
+                "type": "voice.remove.result",
+                "success": success,
+                "name": name,
+            }
+            if not success:
+                payload["error"] = f"Voice '{name}' not found"
+            await websocket.send_json(payload)
+        except Exception as exc:
+            logger.error("voice.remove failed for '%s': %s", name, exc)
+            await websocket.send_json({
+                "type": "voice.remove.result",
+                "success": False,
+                "name": name,
+                "error": str(exc),
+            })
+
+    # ------------------------------------------------------------------
 
     @staticmethod
     async def _send_error(websocket: WebSocket, message: str) -> None:
