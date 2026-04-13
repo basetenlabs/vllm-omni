@@ -378,7 +378,7 @@ Server -> Client:
 {"type": "session.done", "total_sentences": 1}
 ```
 
-## Choosing an Execution Backend: In-Process vs Multiprocessing
+## Choosing an Execution Backend: Uniproc vs Multiprocessing
 
 Qwen3-TTS stage configs support two execution backends controlled by the
 `distributed_executor_backend` engine arg. The performance tradeoff between
@@ -402,7 +402,7 @@ The in-process path eliminates inter-process data transfer (D2H copies,
 msgpack serialisation/deserialisation, tensor detaching). This matters most
 when per-request processing is heavy relative to autoregressive decode.
 
-The Base task involves reference-audio encoding on every request, making IPC
+The Base cloning task involves reference-audio encoding on every request, making IPC
 overhead a larger fraction of total cost. Qwen3-Omni shows a similar pattern.
 
 ### When multiprocessing (`mp`) wins
@@ -413,6 +413,18 @@ Talker and Code2Wav stages dominates.
 CustomVoice is lighter per-request (no reference audio encoding), so the
 process-level parallelism of `mp` outweighs its serialisation cost at
 concurrency ≥ 4.
+
+### How to switch
+
+To use the uniproc executor on a single-GPU setup, pass the
+`qwen3_tts_uniproc.yaml` stage config:
+
+```bash
+vllm serve Qwen/Qwen3-TTS-12Hz-1.7B-Base \
+    --omni \
+    --stage-configs-path vllm_omni/model_executor/stage_configs/qwen3_tts_uniproc.yaml \
+    --port 8091
+```
 
 ## Limitations
 
