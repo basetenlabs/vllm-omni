@@ -27,16 +27,31 @@ else
             exit 1
             ;;
     esac
-    case "$TASK_TYPE" in
-        CustomVoice|VoiceDesign|Base)
-            MODEL="Qwen/Qwen3-TTS-12Hz-${SIZE}-${TASK_TYPE}"
-            ;;
-        *)
-            echo "Unknown task type: $TASK_TYPE"
-            echo "Supported: CustomVoice, VoiceDesign, Base, or a local directory path"
-            exit 1
-            ;;
-    esac
+    VALID_MODELS=(
+        "1.7B-CustomVoice"
+        "1.7B-VoiceDesign"
+        "1.7B-Base"
+        "0.6B-CustomVoice"
+        "0.6B-Base"
+    )
+    COMBO="${SIZE}-${TASK_TYPE}"
+    MATCHED=false
+    for valid in "${VALID_MODELS[@]}"; do
+        if [ "$COMBO" = "$valid" ]; then
+            MATCHED=true
+            break
+        fi
+    done
+    if [ "$MATCHED" = false ]; then
+        echo "Error: Invalid model combination: Qwen/Qwen3-TTS-12Hz-${COMBO}"
+        echo ""
+        echo "Valid models:"
+        for valid in "${VALID_MODELS[@]}"; do
+            echo "  Qwen/Qwen3-TTS-12Hz-${valid}"
+        done
+        exit 1
+    fi
+    MODEL="Qwen/Qwen3-TTS-12Hz-${COMBO}"
 fi
 
 SERVED_MODEL_NAME="${SERVED_MODEL_NAME:-}"
