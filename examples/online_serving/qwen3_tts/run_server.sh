@@ -61,12 +61,16 @@ if [ "$ENABLE_TIMESTAMPS" = true ]; then
     # Reserve GPU memory for the aligner model (~1GB in bf16)
     GPU_MEM_UTIL="${GPU_MEM_UTIL:-0.8}"
 
-    echo "Timestamps enabled — downloading ForcedAligner model: $FORCED_ALIGNER_MODEL"
-    python -c "
+    if [ -d "$FORCED_ALIGNER_MODEL" ]; then
+        echo "Timestamps enabled — using local ForcedAligner model: $FORCED_ALIGNER_MODEL"
+    else
+        echo "Timestamps enabled — downloading ForcedAligner model: $FORCED_ALIGNER_MODEL"
+        python -c "
 from huggingface_hub import snapshot_download
 snapshot_download('${FORCED_ALIGNER_MODEL}')
 print('ForcedAligner model cached successfully')
 "
+    fi
     echo "ForcedAligner will load on device=$FORCED_ALIGNER_DEVICE dtype=$FORCED_ALIGNER_DTYPE"
 else
     GPU_MEM_UTIL="${GPU_MEM_UTIL:-0.9}"
