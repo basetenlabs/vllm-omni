@@ -9,8 +9,19 @@
 #   ./run_server.sh /path/to/local/model                                   # Local model directory
 #   SERVED_MODEL_NAME=my-tts ./run_server.sh                               # Custom served model name
 #   STAGE_CONFIGS_PATH=./my_qwen_stage_config.yaml ./run_server.sh         # Custom stage config
+#
+# Timestamps mode (word-level alignment via Qwen3-ForcedAligner-0.6B):
+#   ./run_server.sh --timestamps CustomVoice 1.7B
+#   FORCED_ALIGNER_MODEL=/local/path ./run_server.sh --timestamps
+#   FORCED_ALIGNER_DEVICE=cuda:1 ./run_server.sh --timestamps
 
 set -e
+
+ENABLE_TIMESTAMPS=false
+if [ "$1" = "--timestamps" ]; then
+    ENABLE_TIMESTAMPS=true
+    shift
+fi
 
 ARG="${1:-CustomVoice}"
 SIZE="${2:-1.7B}"
@@ -42,13 +53,32 @@ fi
 SERVED_MODEL_NAME="${SERVED_MODEL_NAME:-}"
 STAGE_CONFIGS_PATH="${STAGE_CONFIGS_PATH:-vllm_omni/model_executor/stage_configs/qwen3_tts_latency.yaml}"
 
+if [ "$ENABLE_TIMESTAMPS" = true ]; then
+    export FORCED_ALIGNER_MODEL="${FORCED_ALIGNER_MODEL:-Qwen/Qwen3-ForcedAligner-0.6B}"
+    export FORCED_ALIGNER_DEVICE="${FORCED_ALIGNER_DEVICE:-cuda:0}"
+    export FORCED_ALIGNER_DTYPE="${FORCED_ALIGNER_DTYPE:-bfloat16}"
+
+    # Reserve GPU memory for the aligner model (~1GB in bf16)
+    GPU_MEM_UTIL="${GPU_MEM_UTIL:-0.8}"
+
+    echo "Timestamps enabled — downloading ForcedAligner model: $FORCED_ALIGNER_MODEL"
+    python -c "
+from huggingface_hub import snapshot_download
+snapshot_download('${FORCED_ALIGNER_MODEL}')
+print('ForcedAligner model cached successfully')
+"
+    echo "ForcedAligner will load on device=$FORCED_ALIGNER_DEVICE dtype=$FORCED_ALIGNER_DTYPE"
+else
+    GPU_MEM_UTIL="${GPU_MEM_UTIL:-0.9}"
+fi
+
 echo "Starting Qwen3-TTS server with model: $MODEL"
 
 SERVE_ARGS=(
     --stage-configs-path "$STAGE_CONFIGS_PATH"
     --host 0.0.0.0
     --port 8091
-    --gpu-memory-utilization 0.9
+    --gpu-memory-utilization "$GPU_MEM_UTIL"
     --trust-remote-code
     --omni
 )

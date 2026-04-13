@@ -224,6 +224,23 @@ class StreamingSpeechSessionConfig(BaseModel):
             "'clause' also splits on CJK commas ， and semicolons ；."
         ),
     )
+    timestamp_type: Literal["word"] | None = Field(
+        default=None,
+        description=(
+            "Enable timestamp alignment. 'word' returns word-level start/end "
+            "times via the Qwen3-ForcedAligner. Requires the server to be "
+            "started with FORCED_ALIGNER_MODEL set."
+        ),
+    )
+    timestamp_transport_strategy: Literal["sync", "async"] = Field(
+        default="sync",
+        description=(
+            "How timestamps are delivered alongside audio. "
+            "'sync': timestamps are included in each audio.done message. "
+            "'async': audio is sent first; timestamps arrive as separate "
+            "messages after all audio for reduced time-to-first-audio."
+        ),
+    )
 
     @model_validator(mode="after")
     def validate_streaming_constraints(self) -> "StreamingSpeechSessionConfig":

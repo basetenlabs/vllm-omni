@@ -109,6 +109,7 @@ from vllm_omni.entrypoints.openai.protocol.videos import (
 )
 from vllm_omni.entrypoints.openai.serving_chat import OmniOpenAIServingChat
 from vllm_omni.entrypoints.openai.serving_speech import OmniOpenAIServingSpeech
+from vllm_omni.entrypoints.openai.forced_aligner import create_aligner_from_env
 from vllm_omni.entrypoints.openai.serving_speech_stream import OmniStreamingSpeechHandler
 from vllm_omni.entrypoints.openai.serving_video import OmniOpenAIServingVideo, ReferenceImage
 from vllm_omni.entrypoints.openai.storage import STORAGE_MANAGER
@@ -817,8 +818,10 @@ async def omni_init_app_state(
         engine_client, state.openai_serving_models, request_logger=request_logger
     )
 
+    forced_aligner = create_aligner_from_env()
     state.openai_streaming_speech = OmniStreamingSpeechHandler(
         speech_service=state.openai_serving_speech,
+        forced_aligner=forced_aligner,
     )
     state.openai_serving_realtime = OpenAIServingRealtime(
         engine_client=engine_client,
