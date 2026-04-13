@@ -88,4 +88,56 @@ if [ -n "$SERVED_MODEL_NAME" ]; then
     SERVE_ARGS+=(--served-model-name "$SERVED_MODEL_NAME")
 fi
 
-vllm-omni serve "$MODEL" "${SERVE_ARGS[@]}"
+vllm-omni serve "$MODEL" "${SERVE_ARGS[@]}" &
+
+# Wait for the vllm server to be ready before initializing voice clones
+echo "Waiting for vllm server on port 8091..."
+until curl -sf http://localhost:8091/health >/dev/null 2>&1; do
+    sleep 2
+done
+echo "vllm server is ready on port 8091."
+
+if [[ -n "${REQUIRED_VOICES:-}" ]]; then
+    echo "Initializing required voice clones in parallel..."
+    PIDS=()
+    for VOICE in $(echo "$REQUIRED_VOICES" | tr ',' ' '); do
+        REF_AUDIO="/app/data/clone_data/${VOICE}.wav"
+        REF_TEXT="/app/data/clone_data/${VOICE}.txt"
+
+        if [[ ! -f "$REF_AUDIO" ]]; then
+            echo "Missing ref-audio for $VOICE — skipping"
+            continue
+        fi
+
+        CURL_ARGS=(
+            -s -f -X POST "http://localhost:8091/v1/audio/voices"
+            -F "audio_sample=@${REF_AUDIO}"
+            -F "name=${VOICE}"
+            -F "consent=user_consent"
+        )
+
+        if [[ -f "$REF_TEXT" ]]; then
+            CURL_ARGS+=(-F "ref_text=$(cat "$REF_TEXT")")
+        else
+            echo "No ref-text for $VOICE — uploading with audio only"
+        fi
+
+        curl "${CURL_ARGS[@]}" &
+        PIDS+=($!)
+    done
+
+    for PID in "${PIDS[@]}"; do
+        wait "$PID" || echo "Voice init PID $PID failed"
+    done
+    echo "All required voice clones submitted. Waiting for readiness..."
+
+    until curl -sf http://localhost:8091/ready >/dev/null 2>&1; do
+        sleep 1
+    done
+    echo "Server is ready — all required voices initialized."
+else
+    echo "REQUIRED_VOICES not set — skipping voice clone initialization."
+fi
+
+# Keep the server running
+wait
