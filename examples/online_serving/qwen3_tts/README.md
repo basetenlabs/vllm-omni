@@ -393,12 +393,12 @@ investigation).
 | **Multiprocessing** | `distributed_executor_backend: "mp"` | Each stage runs in its own subprocess. The Talker can continue decoding while Code2Wav runs the vocoder in parallel, improving pipeline utilisation under concurrency. |
 
 > **Note:** When `distributed_executor_backend` is omitted and `world_size=1`,
-> vLLM [automatically uses the in-process executor](https://github.com/vllm-project/vllm/blob/main/vllm/config/parallel.py#L825).
-> When `world_size > 1`, it defaults to `mp` regardless of the config value.
+> vLLM [automatically uses the uniproc executor](https://github.com/vllm-project/vllm/blob/main/vllm/config/parallel.py#L825).
+> When `world_size > 1`, it defaults to `mp`.
 
-### When in-process wins
+### When uniproc wins
 
-The in-process path eliminates inter-process data transfer (D2H copies,
+The uniproc path eliminates inter-process data transfer (D2H copies,
 msgpack serialisation/deserialisation, tensor detaching). This matters most
 when per-request processing is heavy relative to autoregressive decode.
 
