@@ -38,7 +38,7 @@ import numpy as np
 from tqdm.asyncio import tqdm
 
 DEFAULT_MODEL = "openbmb/VoxCPM2"
-DEFAULT_SAMPLE_RATE = 24000
+DEFAULT_SAMPLE_RATE = 48000
 DEFAULT_REF_AUDIO_URL = "https://qianwen-res.oss-cn-beijing.aliyuncs.com/Qwen3-TTS-Repo/clone_2.wav"
 DEFAULT_REF_TEXT = (
     "Okay. Yeah. I resent you. I love you. I respect you. "
