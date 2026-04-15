@@ -1525,8 +1525,20 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
         elif self._tts_model_type == "voxcpm2":
             tts_params = {}
             additional: dict[str, Any] = {}
-            if request.ref_audio is not None:
-                wav_list, sr = await self._resolve_ref_audio(request.ref_audio)
+            ref_src = request.ref_audio
+            if ref_src is None and request.voice:
+                voice_lower = request.voice.lower()
+                if voice_lower in self.uploaded_speakers:
+                    ref_src = self._get_uploaded_audio_data(request.voice)
+                    if not ref_src:
+                        raise ValueError(f"Audio file for uploaded voice '{request.voice}' not found")
+                    stored_ref_text = self.uploaded_speakers[voice_lower].get("ref_text")
+                    if stored_ref_text:
+                        additional["prompt_text"] = [stored_ref_text]
+                    additional["voice_name"] = voice_lower
+                    additional["voice_created_at"] = self.uploaded_speakers[voice_lower].get("created_at", 0)
+            if ref_src is not None:
+                wav_list, sr = await self._resolve_ref_audio(ref_src)
                 additional["reference_audio"] = [[wav_list, sr]]
             prompt = {"prompt": request.input}
             if additional:
