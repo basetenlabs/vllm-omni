@@ -855,7 +855,12 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
             return "Input text cannot be empty"
 
         if request.voice is not None:
-            return "'voice' is not supported for VoxCPM"
+            voice_lower = request.voice.lower()
+            if voice_lower not in self.uploaded_speakers:
+                return f"Voice '{request.voice}' is not an uploaded voice; VoxCPM only supports uploaded voices for voice cloning"
+            speaker_info = self.uploaded_speakers[voice_lower]
+            if not speaker_info.get("ref_text"):
+                return f"Uploaded voice '{request.voice}' has no ref_text; VoxCPM voice cloning requires a transcript"
         if request.instructions is not None:
             return "'instructions' is not supported for VoxCPM"
         if request.language is not None:
@@ -1233,6 +1238,21 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
             }
             if request.ref_text is not None:
                 params["ref_text"] = [request.ref_text]
+
+            if request.voice is not None and request.ref_audio is None:
+                voice_lower = request.voice.lower()
+                if voice_lower in self.uploaded_speakers:
+                    speaker_info = self.uploaded_speakers[voice_lower]
+                    audio_data = self._get_uploaded_audio_data(request.voice)
+                    if audio_data:
+                        params["ref_audio"] = [audio_data]
+                        stored_ref_text = speaker_info.get("ref_text")
+                        if stored_ref_text:
+                            params["ref_text"] = [stored_ref_text]
+                        params["voice_name"] = [voice_lower]
+                        params["voice_created_at"] = [speaker_info.get("created_at", 0)]
+                        logger.info("VoxCPM: auto-set ref_audio for uploaded voice '%s'", request.voice)
+
             return params
 
         params: dict[str, Any] = {}
