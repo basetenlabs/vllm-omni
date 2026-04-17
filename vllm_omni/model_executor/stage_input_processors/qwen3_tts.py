@@ -1,5 +1,6 @@
 """Stage input processor for Qwen3-TTS: Talker -> Code2Wav."""
 
+from collections import defaultdict
 from typing import Any
 
 import torch
@@ -130,6 +131,57 @@ def _extract_last_frame(pooling_output: dict[str, Any]) -> torch.Tensor | None:
     raise ValueError(f"Invalid audio_codes shape for Qwen3-TTS async_chunk: {tuple(audio_codes.shape)}")
 
 
+def _stage_frame_to_host(
+    transfer_manager: Any,
+    request_id: str,
+    frame: torch.Tensor,
+) -> None:
+    """Stage a newly-emitted codec frame to host memory without blocking.
+
+    The talker emits one [Q] frame per decode step. Naively calling
+    ``frame.cpu().tolist()`` here forces a synchronous D2H for every frame,
+    which stalls the talker's decode stream (~12.5 Hz x concurrent requests).
+    Instead we queue GPU-side frame references into a per-request list on the
+    transfer_manager and only drain/materialize them at chunk-emit boundaries,
+    collapsing N per-frame syncs into one per-chunk sync.
+    """
+    if frame.device.type == "cpu":
+        # Offline/test path: no async copy possible. Convert directly.
+        transfer_manager.code_prompt_token_ids[request_id].append(frame.tolist())
+        return
+
+    pending = getattr(transfer_manager, "_qwen3_tts_pending_frames", None)
+    if pending is None:
+        pending = defaultdict(list)
+        transfer_manager._qwen3_tts_pending_frames = pending
+    pending[request_id].append(frame)
+
+
+def _drain_pending_frames(transfer_manager: Any, request_id: str) -> None:
+    """Flush staged GPU frames for ``request_id`` into ``code_prompt_token_ids``.
+
+    One batched D2H + ``tolist`` replaces N per-frame transfers.
+    """
+    pending = getattr(transfer_manager, "_qwen3_tts_pending_frames", None)
+    if pending is None:
+        return
+    staged = pending.get(request_id)
+    if not staged:
+        return
+    # Stack on GPU and do a single D2H: one sync for the whole chunk.
+    stacked = torch.stack(staged, dim=0).to(device="cpu", dtype=torch.long)
+    transfer_manager.code_prompt_token_ids[request_id].extend(stacked.tolist())
+    staged.clear()
+
+
+def _pending_length(transfer_manager: Any, request_id: str) -> int:
+    pending = getattr(transfer_manager, "_qwen3_tts_pending_frames", None)
+    if pending is None:
+        return 0
+    staged = pending.get(request_id)
+    return len(staged) if staged else 0
+
+
 def talker2code2wav_async_chunk(
     transfer_manager: Any,
     pooling_output: dict[str, Any] | None,
@@ -146,8 +198,10 @@ def talker2code2wav_async_chunk(
     if isinstance(pooling_output, dict):
         frame = _extract_last_frame(pooling_output)
         if frame is not None:
-            codec_codes = frame.cpu().tolist()
-            transfer_manager.code_prompt_token_ids[request_id].append(codec_codes)
+            # Stage the frame to host memory non-blockingly; the actual D2H is
+            # deferred to chunk-emit boundaries so we only sync once per chunk
+            # instead of once per frame.
+            _stage_frame_to_host(transfer_manager, request_id, frame)
         ref_code = pooling_output.get("ref_code")
         if isinstance(ref_code, torch.Tensor) and ref_code.numel() > 0 and request_payload.get(request_id) is None:
             request_payload[request_id] = ref_code.to(torch.long).cpu().contiguous()
@@ -159,6 +213,13 @@ def talker2code2wav_async_chunk(
     cfg = raw_cfg.get("extra", raw_cfg) if isinstance(raw_cfg, dict) else {}
     chunk_size = int(cfg.get("codec_chunk_frames", 25))
     left_context_size_config = int(cfg.get("codec_left_context_frames", 25))
+    # Connector-level overrides for initial-chunk sizing.
+    #   - initial_codec_chunk_frames: pin IC to a fixed value (disables dynamic
+    #     IC). Lowest TTFA when throughput isn't load-bound.
+    #   - max_initial_codec_chunk_frames: cap the upper end of the dynamic IC
+    #     (still scales with load, but never exceeds this value).
+    cfg_fixed_ic = cfg.get("initial_codec_chunk_frames")
+    cfg_max_ic = cfg.get("max_initial_codec_chunk_frames")
 
     # Per-request override takes priority over dynamic IC.
     per_request_override = False
@@ -175,6 +236,11 @@ def talker2code2wav_async_chunk(
             initial_chunk_size = int(entry.list_data[0])
             per_request_override = True
 
+    # Connector-level fixed IC (second priority, overrides dynamic IC).
+    if not per_request_override and cfg_fixed_ic is not None:
+        initial_chunk_size = int(cfg_fixed_ic)
+        per_request_override = True
+
     # Dynamic IC: cache per request so boundaries stay stable for its lifetime.
     if not per_request_override:
         _ic_cache = getattr(transfer_manager, "_cached_ic", None)
@@ -183,7 +249,18 @@ def talker2code2wav_async_chunk(
             transfer_manager._cached_ic = _ic_cache
         if request_id not in _ic_cache:
             max_ic = max_ic_for_chunk_size(chunk_size)
-            active = sum(1 for v in transfer_manager.code_prompt_token_ids.values() if len(v) > 0)
+            if cfg_max_ic is not None:
+                max_ic = min(max_ic, int(cfg_max_ic))
+            pending_counts = getattr(transfer_manager, "_qwen3_tts_pending_frames", {}) or {}
+            active = sum(
+                1
+                for rid, v in transfer_manager.code_prompt_token_ids.items()
+                if len(v) > 0 or len(pending_counts.get(rid, ())) > 0
+            )
+            # Also count requests visible only in the pending buffer.
+            for rid, staged in pending_counts.items():
+                if staged and rid not in transfer_manager.code_prompt_token_ids:
+                    active += 1
             capacity = getattr(transfer_manager, "scheduler_max_num_seqs", 1)
             _ic_cache[request_id] = compute_dynamic_initial_chunk_size(active, capacity, max_ic)
         initial_chunk_size = _ic_cache[request_id]
@@ -202,10 +279,16 @@ def talker2code2wav_async_chunk(
             chunk_size,
         )
         initial_chunk_size = chunk_size
-    length = len(transfer_manager.code_prompt_token_ids[request_id])
+    # length must include frames that are still staged on GPU awaiting flush,
+    # otherwise the IC/normal-phase boundary checks will be wrong.
+    length = len(transfer_manager.code_prompt_token_ids[request_id]) + _pending_length(
+        transfer_manager, request_id
+    )
 
     if length <= 0:
         if finished:
+            # Drain any pending state so no refs linger on GPU after cancel/flush.
+            _drain_pending_frames(transfer_manager, request_id)
             return {
                 "code_predictor_codes": [],
                 "finished": True,
@@ -235,23 +318,41 @@ def talker2code2wav_async_chunk(
 
     end_index = min(length, left_context_size_config + context_length)
     left_context_size = max(0, end_index - context_length)
+    # Now that we're about to read the window, drain any pending GPU frames in
+    # a single batched D2H. After this, code_prompt_token_ids reflects length.
+    _drain_pending_frames(transfer_manager, request_id)
     window_frames = transfer_manager.code_prompt_token_ids[request_id][-end_index:]
 
-    # Prepend ref_code as decoder context for every chunk so the vocoder
-    # maintains voice-clone speaker identity throughout the stream.  The HF
-    # reference decodes ref_code + all_codes in one pass; without ref_code
-    # context on later chunks the decoder loses speaker identity and produces
-    # distorted audio.  Use `.get()` (not `.pop()`) to keep ref_code for
-    # subsequent chunks.
+    # Prepend ref_code as decoder context only while the decoder's
+    # sliding-attention window would otherwise lack speaker information.
+    # Once we have accumulated at least ``codec_left_context_frames`` of real
+    # generated context (which matches the decoder's sliding_window), the
+    # attention never looks back into ref_code territory and re-processing it
+    # on every chunk is pure wasted FLOPs (the extra output is trimmed by
+    # Code2Wav anyway). Use `.get()` (not `.pop()`) so ref_code is available
+    # for early chunks that genuinely need it.
     ref_code = request_payload.get(request_id)
-    if isinstance(ref_code, torch.Tensor) and ref_code.numel() > 0:
+    if (
+        isinstance(ref_code, torch.Tensor)
+        and ref_code.numel() > 0
+        and left_context_size < left_context_size_config
+    ):
         ref_frames = ref_code.tolist()
         window_frames = ref_frames + window_frames
         left_context_size += len(ref_frames)
 
-    num_quantizers = len(window_frames[0])
     num_frames = len(window_frames)
-    code_predictor_codes = [window_frames[f][q] for q in range(num_quantizers) for f in range(num_frames)]
+    if num_frames == 0:
+        # Defensive: nothing to emit. Should be caught by the earlier length
+        # check, but don't crash on malformed input.
+        num_quantizers = 0
+        code_predictor_codes: list[int] = []
+    else:
+        num_quantizers = len(window_frames[0])
+        # Codebook-major flat layout [Q * F]. A single torch transpose+reshape
+        # is ~Q x faster than the prior Python nested comprehension.
+        window_tensor = torch.as_tensor(window_frames, dtype=torch.long)
+        code_predictor_codes = window_tensor.t().contiguous().reshape(-1).tolist()
 
     info: dict[str, Any] = {
         "code_predictor_codes": code_predictor_codes,

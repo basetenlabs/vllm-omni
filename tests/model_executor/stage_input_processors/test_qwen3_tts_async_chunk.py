@@ -34,20 +34,28 @@ def _req(rid, *, finished, initial_codec_chunk_frames=None):
     )
 
 
-def _tm(*, chunk_frames=25, left_context=25, max_num_seqs=1):
+def _tm(
+    *,
+    chunk_frames=25,
+    left_context=25,
+    max_num_seqs=1,
+    initial_codec_chunk_frames=None,
+    max_initial_codec_chunk_frames=None,
+):
+    extra = {
+        "codec_chunk_frames": chunk_frames,
+        "codec_left_context_frames": left_context,
+    }
+    if initial_codec_chunk_frames is not None:
+        extra["initial_codec_chunk_frames"] = initial_codec_chunk_frames
+    if max_initial_codec_chunk_frames is not None:
+        extra["max_initial_codec_chunk_frames"] = max_initial_codec_chunk_frames
     return SimpleNamespace(
         code_prompt_token_ids=defaultdict(list),
         scheduler_max_num_seqs=max_num_seqs,
         put_req_chunk=defaultdict(int),
         request_payload={},
-        connector=SimpleNamespace(
-            config={
-                "extra": {
-                    "codec_chunk_frames": chunk_frames,
-                    "codec_left_context_frames": left_context,
-                }
-            }
-        ),
+        connector=SimpleNamespace(config={"extra": extra}),
     )
 
 
@@ -285,6 +293,69 @@ def test_ref_code_context_applies_to_all_streaming_chunks():
     assert len(payload["code_predictor_codes"]) == _Q * (20 + 2)
 
 
+def test_ref_code_context_skipped_when_left_context_saturates():
+    """Once the generated left context is >= codec_left_context_frames, the
+    ref_code does not fit in the decoder's sliding-attention window anymore,
+    so prepending it is pure wasted work. The optimization drops ref_code
+    only at this boundary and keeps it while left_context_size < config.
+    """
+    # Use a per-request IC=10 so chunk boundaries are predictable, and
+    # set codec_left_context_frames=8 so the left context saturates on any
+    # chunk whose `length - chunk_size >= 8` (here length=35 -> lc=8).
+    tm = _tm(chunk_frames=25, left_context=8)
+    rid = "r-saturated"
+    tm.put_req_chunk[rid] = 2  # not the first emit
+    tm.code_prompt_token_ids[rid] = [_FRAME[:] for _ in range(45)]
+    ref_code = torch.tensor([[9, 9, 9, 9], [8, 8, 8, 8]], dtype=torch.long)
+    tm.request_payload[rid] = ref_code
+
+    payload = talker2code2wav_async_chunk(
+        transfer_manager=tm,
+        pooling_output={"audio_codes": torch.zeros((0,))},
+        request=_req(rid, finished=False, initial_codec_chunk_frames=10),
+        is_finished=False,
+    )
+
+    assert payload is not None
+    # left_context_size should remain at 8 (no ref_code bump)
+    assert payload["left_context_size"] == 8
+    # Window only contains the 8 left-context + 25 new frames, no ref_code.
+    assert len(payload["code_predictor_codes"]) == _Q * (8 + 25)
+    # ref_code is still retained for future requests or early chunks.
+    assert rid in tm.request_payload
+
+
+def test_pending_gpu_frames_are_counted_for_length_and_drained_on_emit():
+    """GPU-staged frames count toward `length` and are materialized at chunk
+    emit boundaries via a single batched D2H, not one sync per frame."""
+    tm = _tm(chunk_frames=25, left_context=25)
+    rid = "r-pending"
+    # Simulate 5 frames already flushed to host, and 15 staged on-device
+    # via the talker's new non-blocking path. The total (20) lands on an
+    # IC=10 chunk boundary (20 % 10 == 0) so we emit.
+    tm.code_prompt_token_ids[rid] = [_FRAME[:] for _ in range(5)]
+    pending = defaultdict(list)
+    for _ in range(15):
+        pending[rid].append(torch.tensor(_FRAME, dtype=torch.long))  # cpu tensor stands in for a GPU ref
+    tm._qwen3_tts_pending_frames = pending
+
+    payload = talker2code2wav_async_chunk(
+        transfer_manager=tm,
+        pooling_output={"audio_codes": torch.zeros((0,))},
+        request=_req(rid, finished=False, initial_codec_chunk_frames=10),
+        is_finished=False,
+    )
+
+    assert payload is not None
+    # All 20 frames must have been drained into code_prompt_token_ids.
+    assert len(tm.code_prompt_token_ids[rid]) == 20
+    # And the pending buffer must be empty.
+    assert len(pending[rid]) == 0
+    # Payload covers the full window: left_context + new frames.
+    assert len(payload["code_predictor_codes"]) == _Q * 20
+    assert payload["left_context_size"] == 10
+
+
 def test_ref_code_context_can_be_buffered_before_first_emit():
     tm = _tm()
     rid = "r-ref-buffered"
@@ -391,3 +462,64 @@ def test_non_async_processor_filters_out_of_range_codec_values():
     # Only ref_code (1 frame) + 2 valid frames = 3 frames * 4 quantizers = 12 codes
     assert len(prompt["prompt_token_ids"]) == 4 * 3
     assert prompt["additional_information"] == {"left_context_size": [1]}
+
+
+# ── initial-chunk override precedence ──────────────────────────────────────
+# Priority order (highest to lowest):
+#   1. per-request `additional_information.initial_codec_chunk_frames`
+#   2. connector-level `initial_codec_chunk_frames` (fixed IC)
+#   3. connector-level `max_initial_codec_chunk_frames` (cap on dynamic IC)
+#   4. default dynamic IC from load factor
+
+
+def _emitted_ic(tm, rid, *, n_frames, req_ic=None):
+    """Run async-chunk and return the cached IC used for this request."""
+    _call(tm, rid, n_frames=n_frames, req_ic=req_ic)
+    return tm._cached_ic[rid] if hasattr(tm, "_cached_ic") else None
+
+
+def test_connector_fixed_initial_chunk_overrides_dynamic():
+    # Even at high load, a fixed connector IC pins the value.
+    tm = _tm(chunk_frames=25, max_num_seqs=64, initial_codec_chunk_frames=2)
+    # Populate many active requests to push dynamic IC high.
+    for i in range(32):
+        tm.code_prompt_token_ids[f"other_{i}"] = [_FRAME[:] for _ in range(3)]
+    _call(tm, "r", n_frames=1)
+    # Fixed connector IC is applied without caching a dynamic value.
+    assert not hasattr(tm, "_cached_ic") or "r" not in tm._cached_ic
+
+
+def test_per_request_ic_beats_connector_fixed():
+    tm = _tm(chunk_frames=25, max_num_seqs=64, initial_codec_chunk_frames=2)
+    payload = _call(tm, "r", n_frames=10, req_ic=10)
+    assert payload is not None
+    # Per-request IC=10 won: length=10 triggers the first IC emit (10%10==0).
+    assert len(payload["code_predictor_codes"]) == _Q * 10
+
+
+def test_connector_max_ic_caps_dynamic_growth():
+    # High load would select IC=16 (max_ic_for_chunk_size(25)); cap clamps to 2.
+    tm = _tm(
+        chunk_frames=25,
+        max_num_seqs=64,
+        max_initial_codec_chunk_frames=2,
+    )
+    for i in range(64):
+        tm.code_prompt_token_ids[f"other_{i}"] = [_FRAME[:] for _ in range(3)]
+    ic = _emitted_ic(tm, "r", n_frames=1)
+    # Dynamic IC at load=1.0 would be 16; cap keeps it <=2.
+    assert ic is not None and ic <= 2
+
+
+def test_dynamic_ic_still_grows_without_cap():
+    # Regression: default path still scales with load when no overrides present.
+    tm = _tm(chunk_frames=25, max_num_seqs=64)
+    for i in range(32):
+        tm.code_prompt_token_ids[f"other_{i}"] = [_FRAME[:] for _ in range(3)]
+    ic = _emitted_ic(tm, "r", n_frames=1)
+    expected = compute_dynamic_initial_chunk_size(
+        active_requests=33,  # 32 others + self
+        max_num_seqs=64,
+        max_ic=max_ic_for_chunk_size(25),
+    )
+    assert ic == expected

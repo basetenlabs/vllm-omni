@@ -261,6 +261,9 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
             cached_ic = getattr(self, "_cached_ic", None)
             if cached_ic is not None:
                 cached_ic.pop(external_req_id, None)
+            pending = getattr(self, "_qwen3_tts_pending_frames", None)
+            if pending is not None:
+                pending.pop(external_req_id, None)
 
     ########################################################################
     # Cleanup
@@ -298,6 +301,13 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
         cached_ic = getattr(self, "_cached_ic", None)
         if cached_ic is not None:
             cached_ic.pop(external_req_id, None)
+
+        # Staged GPU frames used by per-model async-chunk processors (e.g.
+        # qwen3-tts) must also be released so we don't leak device memory on
+        # request cancellation / completion.
+        pending = getattr(self, "_qwen3_tts_pending_frames", None)
+        if pending is not None:
+            pending.pop(external_req_id, None)
 
     def cleanup(
         self,

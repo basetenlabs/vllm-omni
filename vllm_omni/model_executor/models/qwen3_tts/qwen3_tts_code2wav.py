@@ -53,6 +53,31 @@ class Qwen3TTSCode2Wav(nn.Module):
                 return buf.device
             return torch.device("cpu")
 
+    def _compute_batch_capture_sizes(self) -> list[int]:
+        """Choose the batch-size buckets to capture CUDA graphs for.
+
+        The set is capped by the scheduler's ``max_num_seqs`` so we don't
+        capture graphs that can never be used, and truncated to a small
+        power-of-two ladder to bound total capture memory. Each extra bucket
+        at the largest F adds ~``bs * F * total_upsample * 4`` bytes of
+        static-output memory, so overshooting the scheduler limit is pure
+        waste.
+        """
+        try:
+            scheduler_cfg = getattr(self.vllm_config, "scheduler_config", None)
+            max_num_seqs = int(getattr(scheduler_cfg, "max_num_seqs", 1) or 1)
+        except Exception:
+            max_num_seqs = 1
+        candidate = [1, 2, 4, 8, 16, 32, 64]
+        buckets = [b for b in candidate if b <= max_num_seqs]
+        if not buckets:
+            buckets = [1]
+        # Ensure the scheduler cap itself is a bucket so the biggest steps
+        # actually hit a graph.
+        if max_num_seqs not in buckets and max_num_seqs > buckets[-1]:
+            buckets.append(int(max_num_seqs))
+        return buckets
+
     def _ensure_speech_tokenizer_loaded(self) -> None:
         if self._decoder is not None:
             return
@@ -145,12 +170,21 @@ class Qwen3TTSCode2Wav(nn.Module):
                                 self._decoder_sliding_window,
                             )
 
+                    # Compute batch-size buckets so that multi-request steps
+                    # can replay a pre-captured graph and avoid serial bs=1
+                    # replays. We keep the set small to bound capture memory.
+                    batch_buckets = self._compute_batch_capture_sizes()
+
                     decoder.enable_cudagraph(
                         device=device,
                         codec_chunk_frames=chunk_frames,
                         codec_left_context_frames=left_frames,
+                        batch_capture_sizes=batch_buckets,
                     )
-                    logger.info("Code2Wav decoder CUDA Graph enabled")
+                    logger.info(
+                        "Code2Wav decoder CUDA Graph enabled (bs_buckets=%s)",
+                        batch_buckets,
+                    )
                 except Exception:
                     logger.warning("Failed to enable CUDA Graph for Code2Wav decoder", exc_info=True)
 
@@ -291,13 +325,10 @@ class Qwen3TTSCode2Wav(nn.Module):
             except Exception:
                 pass
 
-        # Decode directly via decoder.chunked_decode(), staying entirely on GPU.
-        # Each request decoded individually with CUDA graph replay at bs=1.
-        wav_tensors: list[torch.Tensor] = []
-        for codes_qf in valid_codes_qf:
-            codes_bqf = codes_qf.unsqueeze(0)  # [1, Q, F]
-            wav = decoder.chunked_decode(codes_bqf)  # [1, 1, wav_len]
-            wav_tensors.append(wav.squeeze(0).squeeze(0))  # [wav_len]
+        # Batched decode path: stack all requests into a single [B, Q, F] and
+        # replay a pre-captured (bs, F) graph when available. This avoids the
+        # serial bs=1 loop and slashes per-request launch overhead.
+        wav_tensors = self._decode_valid_codes(decoder, valid_codes_qf)
 
         audios: list[torch.Tensor] = [empty] * num_req
         srs = [sr_tensor] * num_req
@@ -323,6 +354,81 @@ class Qwen3TTSCode2Wav(nn.Module):
             text_hidden_states=None,
             multimodal_outputs={"model_outputs": audios, "sr": srs},
         )
+
+    def _decode_valid_codes(
+        self,
+        decoder: nn.Module,
+        valid_codes_qf: list[torch.Tensor],
+    ) -> list[torch.Tensor]:
+        """Run the speech-tokenizer decoder across a batch of valid requests.
+
+        Attempts three paths in order of preference:
+        1. Fast batched CUDA-graph replay via the wrapper's ``batched_decode``
+           when all requests share a seq length below the largest capture
+           bucket. Requires the decoder to have an active wrapper exposing
+           ``batched_decode``.
+        2. Single eager batched call (no CUDA graph) as a cheap fallback when
+           the wrapper isn't present but requests can still be stacked.
+        3. Per-request ``chunked_decode`` (legacy) when any single request's
+           F exceeds the wrapper's largest captured size (non-streaming /
+           oversized inputs).
+        """
+        assert valid_codes_qf, "caller should skip empty batches"
+        actual_frames = [int(c.shape[-1]) for c in valid_codes_qf]
+        max_frames = max(actual_frames)
+
+        wrapper = getattr(decoder, "_cudagraph_wrapper", None)
+        use_graph = (
+            getattr(decoder, "_cudagraph_enabled", False)
+            and wrapper is not None
+            and hasattr(wrapper, "batched_decode")
+            and getattr(wrapper, "_warmed_up", False)
+            and wrapper.capture_sizes
+            and max_frames <= int(wrapper.capture_sizes[-1])
+        )
+
+        if len(valid_codes_qf) == 1 and not use_graph:
+            # Preserve the legacy single-request path (which internally uses
+            # the wrapper's bs=1 graph via decode() if enabled).
+            codes_bqf = valid_codes_qf[0].unsqueeze(0)
+            wav = decoder.chunked_decode(codes_bqf)
+            return [wav.squeeze(0).squeeze(0)]
+
+        if not use_graph:
+            # No wrapper available, or an input exceeds all captured sizes.
+            # Fall back to serial chunked_decode; this preserves numerical
+            # behavior for long non-streaming inputs.
+            out: list[torch.Tensor] = []
+            for codes_qf in valid_codes_qf:
+                codes_bqf = codes_qf.unsqueeze(0)
+                wav = decoder.chunked_decode(codes_bqf)
+                out.append(wav.squeeze(0).squeeze(0))
+            return out
+
+        # Build a single [B, Q, F_max] batched input. We pad on the right
+        # with zeros, which is safe for the causal Qwen3-TTS decoder (padding
+        # at the tail cannot leak into kept output positions).
+        q = int(self._num_quantizers)
+        device = valid_codes_qf[0].device
+        dtype = valid_codes_qf[0].dtype
+        batched = torch.zeros(
+            (len(valid_codes_qf), q, max_frames),
+            dtype=dtype,
+            device=device,
+        )
+        for i, codes_qf in enumerate(valid_codes_qf):
+            f_i = int(codes_qf.shape[-1])
+            batched[i, :, :f_i] = codes_qf
+
+        wav_batched = wrapper.batched_decode(batched)  # [B, 1, F_max * upsample]
+
+        upsample = int(self._total_upsample)
+        out: list[torch.Tensor] = []
+        for i, f_i in enumerate(actual_frames):
+            # Slice to each request's actual decoded length before
+            # context-trim runs in the caller.
+            out.append(wav_batched[i, 0, : f_i * upsample])
+        return out
 
     def make_omni_output(self, model_outputs: torch.Tensor | OmniOutput, **kwargs: Any) -> OmniOutput:
         if isinstance(model_outputs, OmniOutput):

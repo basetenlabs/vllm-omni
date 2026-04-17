@@ -254,13 +254,142 @@ def test_disabled_wrapper_matches_eager(decoder, wrapper):
     torch.testing.assert_close(graph_out, eager_out, atol=0, rtol=0)
 
 
-def test_batch_size_gt1_falls_back(decoder, wrapper):
-    """Batch size > 1 should fall back to eager (bit-identical)."""
+def test_batch_size_gt1_falls_back_on_decode(decoder, wrapper):
+    """decode() is the single-request API and must fall back to eager on bs>1."""
     codes = torch.randint(0, 100, (2, NUM_QUANTIZERS, 25), dtype=torch.long, device=DEVICE)
     with torch.no_grad():
         eager_out = decoder(codes)
         graph_out = wrapper.decode(codes)
     torch.testing.assert_close(graph_out, eager_out, atol=0, rtol=0)
+
+
+# ──────────────────────────────────────────────────────────────────
+# 5a. Batched decode (new)
+# ──────────────────────────────────────────────────────────────────
+
+
+@pytest.fixture(scope="module")
+def batched_wrapper(decoder):
+    """A wrapper that captures multi-bs graphs in addition to bs=1."""
+    from vllm_omni.model_executor.models.qwen3_tts.cuda_graph_decoder_wrapper import (
+        CUDAGraphDecoderWrapper as _W,
+    )
+
+    w = _W(
+        decoder=decoder,
+        capture_sizes=[25, 50, 100],
+        batch_capture_sizes=[1, 2, 4],
+        num_quantizers=NUM_QUANTIZERS,
+        enabled=True,
+    )
+    w.warmup(DEVICE)
+    return w
+
+
+@pytest.mark.parametrize("batch,seq_len", [(1, 25), (2, 50), (4, 100)])
+def test_batched_decode_exact_bucket_bit_identical(decoder, batched_wrapper, batch, seq_len):
+    """When (bs, seq_len) matches a captured bucket exactly, output is bit-identical."""
+    codes = torch.randint(0, 100, (batch, NUM_QUANTIZERS, seq_len), dtype=torch.long, device=DEVICE)
+    with torch.no_grad():
+        eager_out = decoder(codes)
+        graph_out = batched_wrapper.batched_decode(codes)
+    torch.testing.assert_close(graph_out, eager_out, atol=0, rtol=0)
+
+
+@pytest.mark.parametrize("batch,bs_bucket,seq_len", [(3, 4, 100), (5, 8, 50)])
+def test_batched_decode_padded_bs_numerically_close(decoder, batched_wrapper, batch, bs_bucket, seq_len):
+    """Batch-padded replay may differ from eager by small FP epsilon due to cuDNN
+    algorithm selection varying with batch size. It must remain numerically close
+    and shape-compatible for the requested sub-slice.
+    """
+    if bs_bucket not in batched_wrapper.batch_capture_sizes and bs_bucket != 8:
+        pytest.skip("bucket not captured in this fixture")
+    codes = torch.randint(0, 100, (batch, NUM_QUANTIZERS, seq_len), dtype=torch.long, device=DEVICE)
+    with torch.no_grad():
+        eager_out = decoder(codes)
+        graph_out = batched_wrapper.batched_decode(codes)
+    assert graph_out.shape == eager_out.shape
+    torch.testing.assert_close(graph_out, eager_out, atol=1e-5, rtol=1e-3)
+
+
+@pytest.mark.parametrize("batch", [1, 2, 3, 4])
+def test_batched_decode_padded_bs_and_seq(decoder, batched_wrapper, batch):
+    """Batch and seq padding should return a correctly shaped, bounded output."""
+    seq_len = 47  # not exact size → pads to 50
+    codes = torch.randint(0, 100, (batch, NUM_QUANTIZERS, seq_len), dtype=torch.long, device=DEVICE)
+    with torch.no_grad():
+        eager_out = decoder(codes)
+        graph_out = batched_wrapper.batched_decode(codes)
+    assert graph_out.shape == eager_out.shape
+    # Padded output must still be clamped to [-1, 1].
+    assert graph_out.min() >= -1.0 and graph_out.max() <= 1.0
+
+
+def test_batched_decode_bs_no_graph_falls_back_to_bs1(decoder, batched_wrapper):
+    """A batch size that exceeds all multi-bs buckets should still run via bs=1 replay."""
+    codes = torch.randint(0, 100, (5, NUM_QUANTIZERS, 25), dtype=torch.long, device=DEVICE)
+    with torch.no_grad():
+        eager_out = decoder(codes)
+        graph_out = batched_wrapper.batched_decode(codes)
+    assert graph_out.shape == eager_out.shape
+
+
+def test_batched_decode_oversized_seq_falls_back_to_eager(decoder, batched_wrapper):
+    """When seq_len exceeds all capture sizes, batched_decode falls back to eager."""
+    codes = torch.randint(0, 100, (2, NUM_QUANTIZERS, 150), dtype=torch.long, device=DEVICE)
+    with torch.no_grad():
+        eager_out = decoder(codes)
+        graph_out = batched_wrapper.batched_decode(codes)
+    torch.testing.assert_close(graph_out, eager_out, atol=0, rtol=0)
+
+
+def test_grid_selects_streaming_sizes_for_multi_bs():
+    """In streaming mode, multi-bs graphs must target (chunk+left_context)
+    and chunk, not the two largest seq sizes. This regression guard catches
+    a past bug where preferred_seq defaulted to the top of the whole list
+    and missed the streaming hot buckets entirely.
+    """
+    from vllm_omni.model_executor.models.qwen3_tts.cuda_graph_decoder_wrapper import (
+        CUDAGraphDecoderWrapper as _W,
+    )
+
+    # seq_sizes modeled on compute_capture_sizes(chunk=25, left=72)
+    seq_sizes = [2, 4, 8, 16, 25, 32, 64, 97, 128, 256, 325]
+    bs_sizes = [1, 2, 4, 8, 16]
+
+    w = _W(decoder=torch.nn.Identity(), capture_sizes=seq_sizes, batch_capture_sizes=bs_sizes)
+    grid = w._select_batched_capture_grid(
+        seq_sizes,
+        bs_sizes,
+        codec_chunk_frames=25,
+        codec_left_context_frames=72,
+    )
+
+    multi_bs_pairs = {(bs, s) for bs, s in grid if bs > 1}
+    # Hot streaming buckets must appear at every bs>1.
+    for bs in [2, 4, 8, 16]:
+        assert (bs, 97) in multi_bs_pairs, f"missing ({bs}, 97)"
+        assert (bs, 25) in multi_bs_pairs, f"missing ({bs}, 25)"
+    # And the spurious "largest seq" buckets must NOT be captured at bs>1.
+    assert (16, 325) not in multi_bs_pairs
+    assert (16, 256) not in multi_bs_pairs
+
+
+def test_grid_falls_back_to_largest_when_not_streaming():
+    """In non-streaming mode (no chunk/left_context), use the two largest
+    seq sizes as a reasonable default."""
+    from vllm_omni.model_executor.models.qwen3_tts.cuda_graph_decoder_wrapper import (
+        CUDAGraphDecoderWrapper as _W,
+    )
+
+    seq_sizes = [8, 16, 64, 128, 256]
+    bs_sizes = [1, 2, 4]
+    w = _W(decoder=torch.nn.Identity(), capture_sizes=seq_sizes, batch_capture_sizes=bs_sizes)
+    grid = w._select_batched_capture_grid(seq_sizes, bs_sizes)
+    multi_bs_pairs = {(bs, s) for bs, s in grid if bs > 1}
+    for bs in [2, 4]:
+        assert (bs, 256) in multi_bs_pairs
+        assert (bs, 128) in multi_bs_pairs
 
 
 def test_deterministic_across_calls(decoder, wrapper):

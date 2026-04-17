@@ -565,9 +565,12 @@ class Qwen3TTSTalkerForConditionalGeneration(nn.Module):
                 full_prompt_embeds, tailing_text_hidden, tts_pad_embed, ref_code_len, ref_code = (
                     self._build_prompt_embeds(task_type=task_type, info_dict=info_dict)
                 )
-                # Store full prompt embeddings on CPU (large, prefill-only).
-                # tailing_text_hidden and tts_pad_embed stay on GPU (gpu_resident_buffer_keys).
-                prompt_embeds_cpu = full_prompt_embeds.detach().to("cpu").contiguous()
+                # Store full prompt embeddings in pinned CPU memory so that
+                # per-chunk H2D copies are async and don't stall the worker.
+                # tailing_text_hidden and tts_pad_embed stay on GPU
+                # (gpu_resident_buffer_keys). For CPU-only mode, fall back to
+                # a regular CPU tensor (pin_memory requires CUDA).
+                prompt_embeds_cpu = self._prompt_embeds_to_host(full_prompt_embeds)
                 info_update: dict[str, Any] = {
                     "talker_prompt_embeds": prompt_embeds_cpu,
                     "tailing_text_hidden": tailing_text_hidden.detach(),
@@ -579,17 +582,14 @@ class Qwen3TTSTalkerForConditionalGeneration(nn.Module):
                     info_update["ref_code"] = ref_code.detach().to("cpu").contiguous()
                 if ref_code_len is not None:
                     info_update["ref_code_len"] = int(ref_code_len)
-                # Always return a span_len slice; if the scheduled placeholder is longer, pad with tts_pad_embed.
-                # This preserves placeholder/embedding alignment.
                 offset = 0
-                s = 0
-                e = span_len
-                take = prompt_embeds_cpu[s:e]
-                if int(take.shape[0]) < span_len:
-                    pad_n = int(span_len - int(take.shape[0]))
-                    pad_rows = tts_pad_embed.reshape(1, -1).to("cpu").expand(pad_n, -1)
-                    take = torch.cat([take, pad_rows], dim=0)
-                prompt_embeds = take.to(device=input_ids.device, dtype=torch.bfloat16)
+                prompt_embeds = self._slice_prompt_embeds_to_device(
+                    prompt_embeds_cpu,
+                    start=0,
+                    span_len=span_len,
+                    tts_pad_embed=tts_pad_embed,
+                    device=input_ids.device,
+                )
                 info_update["talker_prefill_offset"] = int(offset + span_len)
             else:
                 # Subsequent prefill chunk: slice from stored embeddings at running offset.
@@ -598,14 +598,13 @@ class Qwen3TTSTalkerForConditionalGeneration(nn.Module):
                 offset = int(info_dict.get("talker_prefill_offset", 0) or 0)
                 if offset < 0:
                     offset = 0
-                s = max(0, min(offset, int(prompt_embeds_cpu.shape[0])))
-                e = max(0, min(offset + span_len, int(prompt_embeds_cpu.shape[0])))
-                take = prompt_embeds_cpu[s:e]
-                if int(take.shape[0]) < span_len:
-                    pad_n = int(span_len - int(take.shape[0]))
-                    pad_rows = tts_pad_embed.reshape(1, -1).to("cpu").expand(pad_n, -1)
-                    take = torch.cat([take, pad_rows], dim=0)
-                prompt_embeds = take.to(device=input_ids.device, dtype=torch.bfloat16)
+                prompt_embeds = self._slice_prompt_embeds_to_device(
+                    prompt_embeds_cpu,
+                    start=offset,
+                    span_len=span_len,
+                    tts_pad_embed=tts_pad_embed,
+                    device=input_ids.device,
+                )
                 info_update = {"talker_prefill_offset": int(offset + span_len)}
                 info_update["codec_streaming"] = codec_streaming
 
@@ -654,6 +653,58 @@ class Qwen3TTSTalkerForConditionalGeneration(nn.Module):
             "codec_streaming": codec_streaming,
         }
         return input_ids, inputs_embeds_out, info_update
+
+    @staticmethod
+    def _prompt_embeds_to_host(full_prompt_embeds: torch.Tensor) -> torch.Tensor:
+        """Move prompt embeddings to host memory with pinned allocation when CUDA is available.
+
+        Pinned memory enables ``non_blocking=True`` H2D copies on the per-chunk
+        slice path, eliminating the synchronous PCIe stall that the previous
+        pageable CPU tensor incurred every prefill chunk.
+        """
+        detached = full_prompt_embeds.detach()
+        if detached.device.type != "cuda" or not torch.cuda.is_available():
+            return detached.to("cpu").contiguous()
+        host = torch.empty(
+            detached.shape,
+            dtype=detached.dtype,
+            device="cpu",
+            pin_memory=True,
+        )
+        host.copy_(detached, non_blocking=True)
+        return host
+
+    @staticmethod
+    def _slice_prompt_embeds_to_device(
+        prompt_embeds_cpu: torch.Tensor,
+        *,
+        start: int,
+        span_len: int,
+        tts_pad_embed: torch.Tensor,
+        device: torch.device,
+    ) -> torch.Tensor:
+        """Slice the pinned-CPU prompt-embeds tensor and copy to ``device``.
+
+        Any tail padding required to reach ``span_len`` uses ``tts_pad_embed``
+        directly on the target device (which is already GPU-resident), avoiding
+        a pointless round-trip through CPU.
+        """
+        total_rows = int(prompt_embeds_cpu.shape[0])
+        s = max(0, min(start, total_rows))
+        e = max(s, min(start + span_len, total_rows))
+        take_cpu = prompt_embeds_cpu[s:e]
+        rows_cpu = int(take_cpu.shape[0])
+        out = torch.empty(
+            (span_len, int(take_cpu.shape[1])),
+            dtype=torch.bfloat16,
+            device=device,
+        )
+        if rows_cpu > 0:
+            out[:rows_cpu].copy_(take_cpu.to(torch.bfloat16), non_blocking=take_cpu.is_pinned())
+        if rows_cpu < span_len:
+            pad_row = tts_pad_embed.reshape(1, -1).to(device=device, dtype=torch.bfloat16)
+            out[rows_cpu:].copy_(pad_row.expand(span_len - rows_cpu, -1))
+        return out
 
     def postprocess(self, hidden_states: torch.Tensor, **_: Any) -> dict[str, Any]:
         # Keep the last token hidden for the next decode step's code predictor.

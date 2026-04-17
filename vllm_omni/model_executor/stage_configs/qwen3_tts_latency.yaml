@@ -1,0 +1,120 @@
+async_chunk: true
+stage_args:
+  - stage_id: 0
+    stage_type: llm
+    is_comprehension: true
+    runtime:
+      devices: "0"
+    engine_args:
+      model_stage: qwen3_tts
+      max_num_seqs: 64
+      model_arch: Qwen3TTSTalkerForConditionalGeneration
+      worker_type: ar
+      scheduler_cls: vllm_omni.core.sched.omni_ar_scheduler.OmniARScheduler
+      enforce_eager: false
+      trust_remote_code: true
+      async_scheduling: true
+      enable_prefix_caching: false
+      engine_output_type: latent
+      # Must leave headroom for:
+      #   (a) Stage-1 code2wav (shares device 0, gpu_memory_utilization=0.25),
+      #   (b) the speech tokenizer encoder, which is lazy-loaded on the
+      #       first ref_audio request and needs a few hundred MB.
+      # Previously set to 0.7, which combined with stage-1's 0.25 filled
+      # 95% of VRAM and caused CUDA OOM when the encoder was loaded on the
+      # first request ("Failed to move speech tokenizer encoder to cuda:0").
+      # 0.6 gives ~8 GiB of slack, well above the encoder footprint and
+      # leaving room for extra CUDA graph pools captured below.
+      gpu_memory_utilization: 0.6
+      max_num_batched_tokens: 24576
+      max_model_len: 4096
+      # Dense CUDA-graph capture for the autoregressive decode loop.
+      # Covers every benchmark concurrency point (1, 2, 4, 8, 16, 32, 64) plus
+      # intermediate buckets hit during ramp-up / tear-down, so the talker
+      # per-step decode always replays a captured graph instead of falling
+      # back to eager. Biggest TTFA/step-time wins show up at bs=16-32.
+      cudagraph_capture_sizes: [1, 2, 4, 8, 12, 16, 20, 24, 32, 40, 48, 56, 64]
+      custom_process_next_stage_input_func: vllm_omni.model_executor.stage_input_processors.qwen3_tts.talker2code2wav_async_chunk
+    # Use named connector to apply runtime.connectors.extra.
+    output_connectors:
+      to_stage_1: connector_of_shared_memory
+    default_sampling_params:
+      temperature: 0.9
+      top_k: 50
+      max_tokens: 4096
+      seed: 42
+      detokenize: false
+      repetition_penalty: 1.05
+      stop_token_ids: [2150]
+
+  - stage_id: 1
+    stage_type: llm
+    runtime:
+      devices: "0"
+    engine_args:
+      model_stage: code2wav
+      max_num_seqs: 64
+      model_arch: Qwen3TTSCode2Wav
+      worker_type: generation
+      scheduler_cls: vllm_omni.core.sched.omni_generation_scheduler.OmniGenerationScheduler
+      enforce_eager: true
+      trust_remote_code: true
+      async_scheduling: true
+      enable_prefix_caching: false
+      engine_output_type: audio
+      gpu_memory_utilization: 0.25
+      # Must be divisible by num_code_groups and cover (left_context + chunk).
+      # Prefill length is Q * num_frames (e.g. 16 * 2148 = 34368); keep headroom past 32k.
+      max_num_batched_tokens: 65536
+      # async_chunk appends windows per step; max_model_len must cover accumulated flat codec stream.
+      max_model_len: 65536
+    engine_input_source: [0]
+    final_output: true
+    final_output_type: audio
+    # Distributed connector configuration
+    input_connectors:
+      from_stage_0: connector_of_shared_memory
+    tts_args:
+      max_instructions_length: 500
+    default_sampling_params:
+      temperature: 0.0
+      top_p: 1.0
+      top_k: -1
+      max_tokens: 65536
+      seed: 42
+      detokenize: true
+      repetition_penalty: 1.0
+
+runtime:
+  enabled: true
+  defaults:
+    window_size: -1
+    max_inflight: 64
+
+  connectors:
+    connector_of_shared_memory:
+      name: SharedMemoryConnector
+      extra:
+        shm_threshold_bytes: 65536
+        # Frame-aligned codec streaming transport.
+        codec_streaming: true
+        # Connector polling / timeout (unit: loop count, sleep interval in seconds).
+        connector_get_sleep_s: 0.01
+        connector_get_max_wait_first_chunk: 3000
+        connector_get_max_wait: 300
+        # Match the decoder sliding attention window to avoid chunk-boundary noise.
+        codec_chunk_frames: 25
+        codec_left_context_frames: 72
+        # Pin the initial-chunk size to 2 frames. The dynamic IC schedule doubles
+        # at load>=0.25 (2 -> 4 -> 8 -> 16), which multiplies the talker
+        # autoregressive steps needed before first audio — directly responsible
+        # for the TTFA cliff at conc 16/32 on this workload. Throughput was
+        # already flat from conc 8 onward, so growing IC buys nothing here.
+        # Remove this line (or switch to max_initial_codec_chunk_frames) to
+        # re-enable dynamic IC growth if a future workload benefits from it.
+        initial_codec_chunk_frames: 2
+
+  edges:
+    - from: 0
+      to: 1
+      window_size: -1
