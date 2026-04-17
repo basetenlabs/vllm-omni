@@ -326,12 +326,55 @@ def test_batched_decode_padded_bs_and_seq(decoder, batched_wrapper, batch):
 
 
 def test_batched_decode_bs_no_graph_falls_back_to_bs1(decoder, batched_wrapper):
-    """A batch size that exceeds all multi-bs buckets should still run via bs=1 replay."""
+    """A batch size exceeding all multi-bs buckets falls back to eager
+    (padded_bs is None path)."""
     codes = torch.randint(0, 100, (5, NUM_QUANTIZERS, 25), dtype=torch.long, device=DEVICE)
     with torch.no_grad():
         eager_out = decoder(codes)
         graph_out = batched_wrapper.batched_decode(codes)
     assert graph_out.shape == eager_out.shape
+
+
+def test_batched_decode_missing_graph_below_threshold_uses_eager(decoder, batched_wrapper):
+    """When (padded_bs, padded_size) has no captured graph and bs is at or
+    below ``eager_fallback_max_bs``, we take a single batched eager call.
+
+    This exercises the "fast" fallback branch that avoids the per-request
+    replay throughput trap at small/mid batch sizes.
+    """
+    # (bs=2, seq=25) is NOT in the captured grid (preferred_seq=[100, 50])
+    # but padded_bs=2 is in batch_capture_sizes=[1,2,4].
+    assert (2, 25) not in batched_wrapper.graphs
+    assert 2 in batched_wrapper.batch_capture_sizes
+    codes = torch.randint(0, 100, (2, NUM_QUANTIZERS, 25), dtype=torch.long, device=DEVICE)
+    with torch.no_grad():
+        eager_out = decoder(codes)
+        graph_out = batched_wrapper.batched_decode(codes)
+    assert graph_out.shape == eager_out.shape
+    # Single batched eager forward must be bit-identical to a direct decoder call.
+    torch.testing.assert_close(graph_out, eager_out, atol=0, rtol=0)
+
+
+def test_batched_decode_above_threshold_uses_per_request_loop(decoder, batched_wrapper):
+    """Above ``eager_fallback_max_bs``, fallback uses the memory-safe
+    per-request bs=1 replay loop instead of a batched eager forward."""
+    # Lower the cap to force the per-request path for bs=2.
+    original_cap = batched_wrapper.eager_fallback_max_bs
+    batched_wrapper.eager_fallback_max_bs = 1
+    try:
+        # (bs=2, seq=25): no multi-bs graph, bs=1 graph at seq=25 exists.
+        assert (2, 25) not in batched_wrapper.graphs
+        assert (1, 25) in batched_wrapper.graphs
+        codes = torch.randint(0, 100, (2, NUM_QUANTIZERS, 25), dtype=torch.long, device=DEVICE)
+        with torch.no_grad():
+            eager_out = decoder(codes)
+            graph_out = batched_wrapper.batched_decode(codes)
+        assert graph_out.shape == eager_out.shape
+        # Per-request loop concatenation of bs=1 graph replays should match eager
+        # at F=25 exactly (both use captured static tensors sized for seq=25).
+        torch.testing.assert_close(graph_out, eager_out, atol=0, rtol=0)
+    finally:
+        batched_wrapper.eager_fallback_max_bs = original_cap
 
 
 def test_batched_decode_oversized_seq_falls_back_to_eager(decoder, batched_wrapper):
@@ -366,13 +409,30 @@ def test_grid_selects_streaming_sizes_for_multi_bs():
     )
 
     multi_bs_pairs = {(bs, s) for bs, s in grid if bs > 1}
-    # Hot streaming buckets must appear at every bs>1.
+    # Steady-state hot streaming buckets must appear at every bs>1.
     for bs in [2, 4, 8, 16]:
         assert (bs, 97) in multi_bs_pairs, f"missing ({bs}, 97)"
         assert (bs, 25) in multi_bs_pairs, f"missing ({bs}, 25)"
-    # And the spurious "largest seq" buckets must NOT be captured at bs>1.
+    # IC-phase power-of-2 buckets STRICTLY BELOW codec_chunk_frames must also
+    # appear at every bs>1: at high concurrency the IC burst would otherwise
+    # fall into the per-request bs=1 replay loop at bs=16..32 for every
+    # initial chunk, which is the primary stage-1 throughput ceiling.
+    for bs in [2, 4, 8, 16]:
+        for s in [2, 4, 8, 16]:
+            assert (bs, s) in multi_bs_pairs, f"missing IC bucket ({bs}, {s})"
+    # IC buckets AT OR ABOVE codec_chunk_frames (e.g. 32, 64 when chunk=25)
+    # must NOT be captured at bs>1: they're not actually hit during IC (chunk
+    # never exceeds codec_chunk_frames), and their activations blow up CUDA
+    # graph private-pool memory at high bs (observed OOM during warmup at
+    # bs=32, s=32 without this cap).
+    for bs in [2, 4, 8, 16]:
+        assert (bs, 32) not in multi_bs_pairs, f"unexpected IC bucket ({bs}, 32)"
+        assert (bs, 64) not in multi_bs_pairs, f"unexpected IC bucket ({bs}, 64)"
+    # And seq sizes at or above the steady-state primary (other than 97 and 25)
+    # must NOT be captured at bs>1 — they're not part of the streaming hot path.
     assert (16, 325) not in multi_bs_pairs
     assert (16, 256) not in multi_bs_pairs
+    assert (16, 128) not in multi_bs_pairs
 
 
 def test_grid_falls_back_to_largest_when_not_streaming():

@@ -50,6 +50,7 @@ class CUDAGraphDecoderWrapper:
         batch_capture_sizes: list[int] | None = None,
         num_quantizers: int = 8,
         enabled: bool = True,
+        eager_fallback_max_bs: int = 8,
     ):
         self.decoder = decoder
         self._explicit_sizes = capture_sizes is not None
@@ -61,6 +62,16 @@ class CUDAGraphDecoderWrapper:
         self.batch_capture_sizes = user_bs
         self.num_quantizers = num_quantizers
         self.enabled = enabled
+        # Upper bound on batch size for the single-batched eager fallback path
+        # when no multi-bs graph is available. Below/at this threshold we use
+        # ``decoder(codes)`` directly (fast, one launch); above it we fall
+        # back to per-request bs=1 graph replay (slow but memory-safe).
+        #
+        # The cap exists because stage-0 and stage-1 co-reside on the same
+        # GPU in the Qwen3-TTS pipeline; a large-bs eager forward in stage-1
+        # can fragment the CUDA allocator and destabilize stage-0 bursts.
+        # bs<=8 was observed to be safe and unlocks the conc=8/16 win.
+        self.eager_fallback_max_bs = max(1, int(eager_fallback_max_bs))
 
         # Keyed by (bs, seq_len)
         self.graphs: dict[tuple[int, int], CUDAGraph] = {}
@@ -119,15 +130,21 @@ class CUDAGraphDecoderWrapper:
         """Choose the (bs, seq_len) pairs to capture.
 
         We always capture the bs=1 row for backward compatibility. For bs>1
-        we only capture the "hot" streaming seq sizes so total graph memory
-        and warmup time stay bounded:
+        we capture the "hot" streaming seq sizes so total graph memory and
+        warmup time stay bounded:
 
-        * In streaming mode (``codec_chunk_frames>0``), the two hot sizes are
-          ``codec_chunk_frames + codec_left_context_frames`` (steady-state) and
-          ``codec_chunk_frames`` (saturated-context after we stop prepending
-          ref_code / left_context). These are the only seq lengths that
-          actually flow through Stage-1 in streaming deployments, so capturing
-          them at every bs bucket maximizes graph hit-rate.
+        * In streaming mode (``codec_chunk_frames>0``), the hot sizes are:
+            - ``codec_chunk_frames + codec_left_context_frames`` (steady-state)
+            - ``codec_chunk_frames`` (saturated-context after we stop prepending
+              ref_code / left_context)
+            - the IC-phase power-of-2 buckets below the steady-state primary
+              (e.g. {2, 4, 8, 16, 32} for chunk=25). These are dominant at
+              high concurrency where many requests burst through IC together:
+              falling back to a per-request bs=1 replay loop at bs=16..32 for
+              every IC chunk is the primary stage-1 throughput ceiling.
+          These are the only seq lengths that actually flow through Stage-1
+          in streaming deployments, so capturing them at every bs bucket
+          maximizes graph hit-rate.
         * Otherwise (non-streaming), we fall back to the two largest captured
           seq sizes for multi-bs — a reasonable proxy for full-utterance
           decode buckets.
@@ -145,6 +162,30 @@ class CUDAGraphDecoderWrapper:
                 preferred_seq.append(primary)
             if codec_chunk_frames in seq_sizes and codec_chunk_frames not in preferred_seq:
                 preferred_seq.append(codec_chunk_frames)
+            # IC-phase buckets: the actual chunks produced during the initial
+            # context-growth phase (before left_context saturates) pad to the
+            # power-of-2 seq sizes below the steady-state primary. At high
+            # concurrency these are the dominant path for Stage-1: the IC
+            # burst involves every active request decoding a small-F chunk
+            # simultaneously. Capturing (bs, F) graphs here eliminates the
+            # per-request fallback loop for the IC-phase hot path.
+            #
+            # We cap IC buckets at ``s < codec_chunk_frames`` (not ``< primary``)
+            # because:
+            #  - No IC chunk exceeds ``codec_chunk_frames`` (once it does, the
+            #    left_context is saturated and we're in steady-state, already
+            #    covered by the ``chunk+left_context`` primary bucket).
+            #  - Buckets ≥ chunk_frames (e.g. 32 and 64 when chunk=25) have
+            #    activation tensors that blow up CUDA graph private-pool
+            #    memory at high bs (observed OOM during warmup at bs=32, s=32
+            #    when this cap wasn't in place).
+            for s in seq_sizes:
+                if s >= codec_chunk_frames:
+                    continue
+                if s in preferred_seq:
+                    continue
+                if s > 0 and (s & (s - 1)) == 0:
+                    preferred_seq.append(s)
 
         if not preferred_seq:
             preferred_seq = sorted(set(seq_sizes), reverse=True)[:2]
@@ -270,9 +311,29 @@ class CUDAGraphDecoderWrapper:
             return self.decoder(codes)
         key = (padded_bs, padded_size)
         if key not in self.graphs:
-            # Fall back to per-request replay if multi-bs graph wasn't captured
-            # but a bs=1 graph is available at the same seq bucket. This keeps
-            # us on the fast path even when batch_capture_sizes is conservative.
+            # No captured multi-bs graph at this (bs, F). We have two fallback
+            # options:
+            #   (a) a single batched eager call on the full [B, Q, F]
+            #   (b) a serial per-request replay of the bs=1 graph at this F
+            #
+            # (a) is ~O(bs) faster than (b) at small/mid bs but allocates
+            # O(bs) more transient activation memory. In the Qwen3-TTS
+            # pipeline stage-0 and stage-1 share the GPU, so a large-bs
+            # eager forward in stage-1 can fragment the allocator and
+            # destabilize a concurrent stage-0 prefill burst.
+            #
+            # We pick (a) up to ``eager_fallback_max_bs`` (covers the common
+            # conc=2..8 IC-phase buckets that aren't in preferred_seq) and
+            # fall back to (b) above that threshold for memory safety.
+            # bs==1 always takes the bs=1 graph replay since it's strictly
+            # better than eager (same work, no launch overhead).
+            if actual_bs == 1:
+                bs1_key = (1, padded_size)
+                if bs1_key in self.graphs:
+                    return self.decode(codes)
+                return self.decoder(codes)
+            if actual_bs <= self.eager_fallback_max_bs:
+                return self.decoder(codes)
             bs1_key = (1, padded_size)
             if bs1_key in self.graphs:
                 outs = [self.decode(codes[i : i + 1]) for i in range(actual_bs)]
