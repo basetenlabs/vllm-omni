@@ -110,6 +110,7 @@ from vllm_omni.entrypoints.openai.protocol.videos import (
 )
 from vllm_omni.entrypoints.openai.serving_chat import OmniOpenAIServingChat
 from vllm_omni.entrypoints.openai.serving_speech import OmniOpenAIServingSpeech
+from vllm_omni.entrypoints.openai.forced_aligner import create_aligner_from_env
 from vllm_omni.entrypoints.openai.serving_speech_stream import OmniStreamingSpeechHandler
 from vllm_omni.entrypoints.openai.serving_video import OmniOpenAIServingVideo, ReferenceImage
 from vllm_omni.entrypoints.openai.storage import STORAGE_MANAGER
@@ -819,8 +820,10 @@ async def omni_init_app_state(
         engine_client, state.openai_serving_models, request_logger=request_logger
     )
 
+    forced_aligner = create_aligner_from_env()
     state.openai_streaming_speech = OmniStreamingSpeechHandler(
         speech_service=state.openai_serving_speech,
+        forced_aligner=forced_aligner,
     )
     state.openai_serving_realtime = OpenAIServingRealtime(
         engine_client=engine_client,
@@ -1248,6 +1251,68 @@ async def health(raw_request: Request) -> JSONResponse:
 
     return JSONResponse(
         content={"status": "unhealthy", "reason": "No engine initialized"},
+        status_code=HTTPStatus.SERVICE_UNAVAILABLE.value,
+    )
+
+_remove_route_from_router(router, "/ready")
+
+@router.get("/ready")
+async def ready(raw_request: Request) -> JSONResponse:
+    """Readiness probe that gates on required voices being initialized.
+
+    Reads the ``REQUIRED_VOICES`` environment variable (comma-separated voice
+    names). Returns 200 only when every listed voice is present in the speech
+    handler's ``supported_speakers`` set. When ``REQUIRED_VOICES`` is unset or
+    empty the endpoint falls back to a basic engine health check.
+    """
+    required_voices_raw = os.environ.get("REQUIRED_VOICES", "")
+    required_voices = {v.strip().lower() for v in required_voices_raw.split(",") if v.strip()}
+
+    handler = Omnispeech(raw_request)
+
+    if required_voices:
+        if handler is None:
+            return JSONResponse(
+                content={
+                    "ready": False,
+                    "reason": "Speech handler not initialized",
+                    "missing_voices": sorted(required_voices),
+                },
+                status_code=HTTPStatus.SERVICE_UNAVAILABLE.value,
+            )
+
+        available = {s.lower() for s in handler.supported_speakers} if handler.supported_speakers else set()
+        missing = sorted(required_voices - available)
+        if missing:
+            return JSONResponse(
+                content={
+                    "ready": False,
+                    "reason": "Required voices not yet initialized",
+                    "missing_voices": missing,
+                    "available_voices": sorted(available),
+                },
+                status_code=HTTPStatus.SERVICE_UNAVAILABLE.value,
+            )
+
+        return JSONResponse(content={"ready": True, "voices": sorted(required_voices)})
+
+    # No required voices — fall back to basic engine liveness.
+    diffusion_engine = getattr(raw_request.app.state, "diffusion_engine", None)
+    if diffusion_engine is not None:
+        if hasattr(diffusion_engine, "is_running") and diffusion_engine.is_running:
+            return JSONResponse(content={"ready": True})
+        return JSONResponse(
+            content={"ready": False, "reason": "Diffusion engine is not running"},
+            status_code=HTTPStatus.SERVICE_UNAVAILABLE.value,
+        )
+
+    engine_client = getattr(raw_request.app.state, "engine_client", None)
+    if engine_client is not None:
+        await engine_client.check_health()
+        return JSONResponse(content={"ready": True})
+
+    return JSONResponse(
+        content={"ready": False, "reason": "No engine initialized"},
         status_code=HTTPStatus.SERVICE_UNAVAILABLE.value,
     )
 

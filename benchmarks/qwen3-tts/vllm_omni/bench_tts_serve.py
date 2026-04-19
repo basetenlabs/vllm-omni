@@ -96,8 +96,62 @@ def pcm_bytes_to_duration(num_bytes: int, sample_rate: int = 24000, sample_width
     return num_samples / sample_rate
 
 
+CACHED_VOICE_NAME = "bench_cached_voice"
+
+
+async def register_cached_voice(host: str, port: int) -> bool:
+    """Download ref audio and register it as a cached voice on the server.
+
+    Returns True on success, False on failure.
+    """
+    voices_url = f"http://{host}:{port}/v1/audio/voices"
+
+    async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=120)) as session:
+        print(f"  Downloading reference audio from {REF_AUDIO}...")
+        async with session.get(REF_AUDIO) as resp:
+            if resp.status != 200:
+                print(f"  [ERROR] Failed to download ref audio: HTTP {resp.status}")
+                return False
+            audio_bytes = await resp.read()
+
+        print(f"  Uploading voice '{CACHED_VOICE_NAME}' to {voices_url}...")
+        form = aiohttp.FormData()
+        form.add_field("name", CACHED_VOICE_NAME)
+        form.add_field("consent", "benchmark-consent")
+        form.add_field("ref_text", REF_TEXT)
+        form.add_field(
+            "audio_sample",
+            audio_bytes,
+            filename="ref_audio.wav",
+            content_type="audio/wav",
+        )
+
+        async with session.post(voices_url, data=form) as resp:
+            body = await resp.text()
+            if resp.status != 200:
+                print(f"  [ERROR] Failed to register voice: HTTP {resp.status}: {body}")
+                return False
+            print(f"  Voice '{CACHED_VOICE_NAME}' registered successfully.")
+            return True
+
+
+async def delete_cached_voice(host: str, port: int) -> None:
+    """Remove the cached voice from the server."""
+    url = f"http://{host}:{port}/v1/audio/voices/{CACHED_VOICE_NAME}"
+    async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=30)) as session:
+        async with session.delete(url) as resp:
+            if resp.status == 200:
+                print(f"  Cleaned up cached voice '{CACHED_VOICE_NAME}'.")
+            else:
+                print(f"  Warning: failed to delete cached voice (HTTP {resp.status}).")
+
+
 def create_payload(
-    prompt: str, task_type: str = "CustomVoice", voice: str = "vivian", language: str = "English"
+    prompt: str,
+    task_type: str = "CustomVoice",
+    voice: str = "vivian",
+    language: str = "English",
+    cache_voice: bool = False,
 ) -> dict:
     payload = {
         "input": prompt,
@@ -108,8 +162,11 @@ def create_payload(
     }
 
     if task_type == "Base":
-        payload["ref_audio"] = REF_AUDIO
-        payload["ref_text"] = REF_TEXT
+        if cache_voice:
+            payload["voice"] = CACHED_VOICE_NAME
+        else:
+            payload["ref_audio"] = REF_AUDIO
+            payload["ref_text"] = REF_TEXT
     elif task_type == "CustomVoice":
         payload["voice"] = voice
     elif task_type == "VoiceDesign":
@@ -125,10 +182,11 @@ async def send_tts_request(
     task_type: str = "CustomVoice",
     voice: str = "vivian",
     language: str = "English",
+    cache_voice: bool = False,
     pbar: tqdm | None = None,
 ) -> RequestResult:
     """Send a streaming TTS request and measure latency metrics."""
-    payload = create_payload(prompt, task_type, voice, language)
+    payload = create_payload(prompt, task_type, voice, language, cache_voice)
 
     result = RequestResult(prompt=prompt)
     st = time.perf_counter()
@@ -176,6 +234,7 @@ async def run_benchmark(
     task_type: str = "CustomVoice",
     voice: str = "vivian",
     language: str = "English",
+    cache_voice: bool = False,
 ) -> BenchmarkResult:
     """Run benchmark at a given concurrency level."""
     api_url = f"http://{host}:{port}/v1/audio/speech"
@@ -196,7 +255,9 @@ async def run_benchmark(
         warmup_tasks = []
         for i in range(num_warmups):
             prompt = PROMPTS[i % len(PROMPTS)]
-            warmup_tasks.append(send_tts_request(session, api_url, prompt, task_type, voice, language))
+            warmup_tasks.append(
+                send_tts_request(session, api_url, prompt, task_type, voice, language, cache_voice)
+            )
         await asyncio.gather(*warmup_tasks)
         print("  Warmup done.")
 
@@ -210,7 +271,9 @@ async def run_benchmark(
 
     async def limited_request(prompt):
         async with semaphore:
-            return await send_tts_request(session, api_url, prompt, task_type, voice, language, pbar)
+            return await send_tts_request(
+                session, api_url, prompt, task_type, voice, language, cache_voice, pbar
+            )
 
     start_time = time.perf_counter()
     tasks = [asyncio.create_task(limited_request(p)) for p in request_prompts]
@@ -318,21 +381,40 @@ async def run_benchmark(
 
 
 async def main(args):
-    all_results = []
+    cache_voice = args.cache_voice
 
-    for concurrency in args.max_concurrency:
-        result = await run_benchmark(
-            host=args.host,
-            port=args.port,
-            num_prompts=args.num_prompts,
-            max_concurrency=concurrency,
-            num_warmups=args.num_warmups,
-            task_type=args.task_type,
-            voice=args.voice,
-            language=args.language,
-        )
-        result.config_name = args.config_name
-        all_results.append(asdict(result))
+    if cache_voice:
+        if args.task_type != "Base":
+            print(
+                f"  Warning: --cache-voice is only useful with --task-type Base "
+                f"(got '{args.task_type}'). Ignoring."
+            )
+            cache_voice = False
+        else:
+            ok = await register_cached_voice(args.host, args.port)
+            if not ok:
+                print("  Aborting: could not register cached voice.")
+                return []
+
+    all_results = []
+    try:
+        for concurrency in args.max_concurrency:
+            result = await run_benchmark(
+                host=args.host,
+                port=args.port,
+                num_prompts=args.num_prompts,
+                max_concurrency=concurrency,
+                num_warmups=args.num_warmups,
+                task_type=args.task_type,
+                voice=args.voice,
+                language=args.language,
+                cache_voice=cache_voice,
+            )
+            result.config_name = args.config_name
+            all_results.append(asdict(result))
+    finally:
+        if cache_voice:
+            await delete_cached_voice(args.host, args.port)
 
     # Save results
     result_dir = Path(args.result_dir)
@@ -357,6 +439,12 @@ def parse_args():
     )
     parser.add_argument("--num-warmups", type=int, default=3)
     parser.add_argument("--task-type", type=str, default="CustomVoice", choices=["CustomVoice", "VoiceDesign", "Base"])
+    parser.add_argument(
+        "--cache-voice",
+        action="store_true",
+        help="Pre-register ref audio as a cached voice on the server instead of "
+        "sending ref_audio/ref_text with every request. Only applies to --task-type Base.",
+    )
     parser.add_argument("--voice", type=str, default="vivian")
     parser.add_argument("--language", type=str, default="English")
     parser.add_argument(
