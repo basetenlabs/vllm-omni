@@ -19,6 +19,7 @@ Configuration env vars:
 import asyncio
 import os
 import threading
+import unicodedata
 from concurrent.futures import ThreadPoolExecutor
 from typing import Any
 
@@ -26,6 +27,118 @@ import numpy as np
 from vllm.logger import init_logger
 
 logger = init_logger(__name__)
+
+
+# The underlying ``Qwen3ForcedAligner`` tokenizes the input text by (a)
+# splitting on any whitespace, (b) stripping every character that isn't a
+# letter / digit / apostrophe, and (c) dropping pure-punctuation segments
+# entirely.  That means its ``words`` output cannot be joined back into the
+# original text, which breaks downstream consumers that key a cache on the
+# synthesized text (they need ``" ".join(words) == original_text``).
+#
+# The helpers below re-derive the original whitespace-delimited tokens and
+# attach the matching start/end times produced by the aligner so the invariant
+# holds.  They mirror the tokenization logic in
+# ``qwen_asr.Qwen3ForceAlignProcessor`` so the mapping is exact.
+
+
+def _is_kept_char(ch: str) -> bool:
+    if ch == "'":
+        return True
+    cat = unicodedata.category(ch)
+    return cat.startswith("L") or cat.startswith("N")
+
+
+def _is_cjk_char(ch: str) -> bool:
+    code = ord(ch)
+    return (
+        0x4E00 <= code <= 0x9FFF  # CJK Unified Ideographs
+        or 0x3400 <= code <= 0x4DBF  # Extension A
+        or 0x20000 <= code <= 0x2A6DF  # Extension B
+        or 0x2A700 <= code <= 0x2B73F  # Extension C
+        or 0x2B740 <= code <= 0x2B81F  # Extension D
+        or 0x2B820 <= code <= 0x2CEAF  # Extension E
+        or 0xF900 <= code <= 0xFAFF  # Compatibility Ideographs
+    )
+
+
+def _clean_token(token: str) -> str:
+    return "".join(ch for ch in token if _is_kept_char(ch))
+
+
+def _split_cjk_subtokens(cleaned: str) -> list[str]:
+    """Split a cleaned token into the sub-tokens the aligner would emit.
+
+    For pure-Latin tokens this is a single-element list; CJK characters are
+    each emitted as their own sub-token.
+    """
+    if not cleaned:
+        return []
+    out: list[str] = []
+    buf: list[str] = []
+    for ch in cleaned:
+        if _is_cjk_char(ch):
+            if buf:
+                out.append("".join(buf))
+                buf = []
+            out.append(ch)
+        else:
+            buf.append(ch)
+    if buf:
+        out.append("".join(buf))
+    return out
+
+
+def _attach_timestamps_to_original_tokens(
+    text: str,
+    aligner_starts: list[float],
+    aligner_ends: list[float],
+) -> tuple[list[str], list[float], list[float]]:
+    """Map aligner output onto the whitespace tokens of ``text``.
+
+    Returns ``(tokens, starts, ends)`` such that ``" ".join(tokens) == text``.
+    Pure-punctuation tokens (and empties from runs of spaces) receive a
+    zero-duration timestamp anchored at the previous token's end time so the
+    sequence stays monotonic.
+
+    Only handles space-separated languages correctly; languages whose aligner
+    tokenization doesn't preserve whitespace boundaries (Japanese, Korean) are
+    still returned best-effort but may not satisfy the join invariant.
+    """
+    tokens = text.split(" ")
+    out_starts: list[float] = [0.0] * len(tokens)
+    out_ends: list[float] = [0.0] * len(tokens)
+
+    ai = 0
+    n = len(aligner_starts)
+    prev_end = 0.0
+
+    for i, tok in enumerate(tokens):
+        cleaned = _clean_token(tok)
+        if not cleaned:
+            out_starts[i] = prev_end
+            out_ends[i] = prev_end
+            continue
+        sub = _split_cjk_subtokens(cleaned)
+        k = len(sub)
+        if k == 0 or ai + k > n:
+            out_starts[i] = prev_end
+            out_ends[i] = prev_end
+            continue
+        out_starts[i] = aligner_starts[ai]
+        out_ends[i] = aligner_ends[ai + k - 1]
+        prev_end = out_ends[i]
+        ai += k
+
+    if ai != n:
+        logger.debug(
+            "Forced-aligner produced %d tokens but original text needed %d; "
+            "timestamps may be approximate.",
+            n,
+            ai,
+        )
+
+    return tokens, out_starts, out_ends
 
 
 class ForcedAligner:
@@ -108,19 +221,23 @@ class ForcedAligner:
         if not results or not results[0]:
             return empty
 
-        words: list[str] = []
-        start_times: list[float] = []
-        end_times: list[float] = []
+        aligner_starts: list[float] = []
+        aligner_ends: list[float] = []
         for item in results[0]:
-            words.append(item.text)
-            start_times.append(round(item.start_time, 4))
-            end_times.append(round(item.end_time, 4))
+            aligner_starts.append(item.start_time)
+            aligner_ends.append(item.end_time)
+
+        # Re-attach timestamps to the original whitespace tokens so that
+        # " ".join(words) == text (required by text-keyed caches upstream).
+        tokens, token_starts, token_ends = _attach_timestamps_to_original_tokens(
+            text, aligner_starts, aligner_ends
+        )
 
         return {
             "word_alignment": {
-                "words": words,
-                "word_start_times_seconds": start_times,
-                "word_end_times_seconds": end_times,
+                "words": tokens,
+                "word_start_times_seconds": [round(t, 4) for t in token_starts],
+                "word_end_times_seconds": [round(t, 4) for t in token_ends],
             }
         }
 
