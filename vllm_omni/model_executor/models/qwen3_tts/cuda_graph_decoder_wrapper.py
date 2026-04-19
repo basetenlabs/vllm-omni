@@ -81,6 +81,24 @@ class CUDAGraphDecoderWrapper:
         self._warmed_up = False
         self._device = None
 
+        # --- diagnostic counters for batched_decode path selection ---
+        # Enables triage of throughput cliffs by revealing when we're on the
+        # slow "per-request bs=1 loop" fallback vs. the fast captured-graph
+        # replay path. Counters are printed every ``_stats_log_interval``
+        # batched_decode calls and reset after each print, so the snapshot
+        # reflects recent traffic only.
+        self._stats: dict[str, int] = {
+            "calls": 0,
+            "graph_hit": 0,
+            "bs1_graph_hit_via_batched": 0,
+            "eager_small_bs": 0,
+            "per_request_loop": 0,
+            "eager_full_fallback": 0,
+        }
+        self._miss_keys: dict[tuple[int, int], int] = {}
+        self._hit_keys: dict[tuple[int, int], int] = {}
+        self._stats_log_interval = 500
+
     @staticmethod
     def compute_capture_sizes(
         codec_chunk_frames: int = 0,
@@ -156,29 +174,24 @@ class CUDAGraphDecoderWrapper:
             return grid
 
         preferred_seq: list[int] = []
+        # IC-transition buckets are the power-of-2 sizes between
+        # codec_chunk_frames and primary. These are hit by every request
+        # during left_context ramp-up (e.g. chunk 2 of every request at
+        # chunk=25/left=72 has F=50 → pads to 64). They have larger
+        # activation footprints and blew up CUDA graph private pools at
+        # high bs during warmup (observed OOM at bs=32 size=32/64), so we
+        # capture them only at bs <= ``ic_transition_cap_bs``.
+        ic_transition: list[int] = []
+        ic_transition_cap_bs = 16
         if codec_chunk_frames > 0:
             primary = codec_chunk_frames + max(0, codec_left_context_frames)
             if primary in seq_sizes:
                 preferred_seq.append(primary)
             if codec_chunk_frames in seq_sizes and codec_chunk_frames not in preferred_seq:
                 preferred_seq.append(codec_chunk_frames)
-            # IC-phase buckets: the actual chunks produced during the initial
-            # context-growth phase (before left_context saturates) pad to the
-            # power-of-2 seq sizes below the steady-state primary. At high
-            # concurrency these are the dominant path for Stage-1: the IC
-            # burst involves every active request decoding a small-F chunk
-            # simultaneously. Capturing (bs, F) graphs here eliminates the
-            # per-request fallback loop for the IC-phase hot path.
-            #
-            # We cap IC buckets at ``s < codec_chunk_frames`` (not ``< primary``)
-            # because:
-            #  - No IC chunk exceeds ``codec_chunk_frames`` (once it does, the
-            #    left_context is saturated and we're in steady-state, already
-            #    covered by the ``chunk+left_context`` primary bucket).
-            #  - Buckets ≥ chunk_frames (e.g. 32 and 64 when chunk=25) have
-            #    activation tensors that blow up CUDA graph private-pool
-            #    memory at high bs (observed OOM during warmup at bs=32, s=32
-            #    when this cap wasn't in place).
+            # IC-phase power-of-2 buckets BELOW codec_chunk_frames (cheap
+            # activations, safe at every bs). These are dominant at high
+            # concurrency when requests burst through IC together.
             for s in seq_sizes:
                 if s >= codec_chunk_frames:
                     continue
@@ -186,6 +199,18 @@ class CUDAGraphDecoderWrapper:
                     continue
                 if s > 0 and (s & (s - 1)) == 0:
                     preferred_seq.append(s)
+            # IC-transition power-of-2 buckets between codec_chunk_frames
+            # and primary (e.g. 32 and 64 for chunk=25, left=72). Hot path
+            # for "chunk N of every request during IC ramp-up"; observed
+            # as >20% of Stage-1 calls falling into per-request serial
+            # replay when absent. Capped at bs <= ic_transition_cap_bs.
+            for s in seq_sizes:
+                if s < codec_chunk_frames or s >= primary:
+                    continue
+                if s in preferred_seq or s in ic_transition:
+                    continue
+                if s > 0 and (s & (s - 1)) == 0:
+                    ic_transition.append(s)
 
         if not preferred_seq:
             preferred_seq = sorted(set(seq_sizes), reverse=True)[:2]
@@ -195,6 +220,9 @@ class CUDAGraphDecoderWrapper:
                 continue
             for s in preferred_seq:
                 grid.append((bs, s))
+            if bs <= ic_transition_cap_bs:
+                for s in ic_transition:
+                    grid.append((bs, s))
         return grid
 
     def warmup(
@@ -307,7 +335,14 @@ class CUDAGraphDecoderWrapper:
         padded_bs = self._get_padded_batch_size(actual_bs)
         padded_size = self._get_padded_size(actual_size)
 
+        self._stats["calls"] += 1
+
         if padded_bs is None or padded_size is None:
+            self._stats["eager_full_fallback"] += 1
+            self._miss_keys[(int(actual_bs), int(actual_size))] = (
+                self._miss_keys.get((int(actual_bs), int(actual_size)), 0) + 1
+            )
+            self._maybe_log_stats()
             return self.decoder(codes)
         key = (padded_bs, padded_size)
         if key not in self.graphs:
@@ -327,26 +362,87 @@ class CUDAGraphDecoderWrapper:
             # fall back to (b) above that threshold for memory safety.
             # bs==1 always takes the bs=1 graph replay since it's strictly
             # better than eager (same work, no launch overhead).
+            self._miss_keys[key] = self._miss_keys.get(key, 0) + 1
             if actual_bs == 1:
                 bs1_key = (1, padded_size)
                 if bs1_key in self.graphs:
+                    self._stats["bs1_graph_hit_via_batched"] += 1
+                    self._maybe_log_stats()
                     return self.decode(codes)
+                self._stats["eager_full_fallback"] += 1
+                self._maybe_log_stats()
                 return self.decoder(codes)
             if actual_bs <= self.eager_fallback_max_bs:
+                self._stats["eager_small_bs"] += 1
+                self._maybe_log_stats()
                 return self.decoder(codes)
             bs1_key = (1, padded_size)
             if bs1_key in self.graphs:
+                self._stats["per_request_loop"] += 1
+                self._maybe_log_stats()
                 outs = [self.decode(codes[i : i + 1]) for i in range(actual_bs)]
                 return torch.cat(outs, dim=0)
+            self._stats["eager_full_fallback"] += 1
+            self._maybe_log_stats()
             return self.decoder(codes)
+
+        self._stats["graph_hit"] += 1
+        self._hit_keys[key] = self._hit_keys.get(key, 0) + 1
 
         static_in = self.static_inputs[key]
         static_in.zero_()
         static_in[:actual_bs, :, :actual_size].copy_(codes)
         self.graphs[key].replay()
 
+        self._maybe_log_stats()
+
         actual_out_len = actual_size * self.decoder.total_upsample
         return self.static_outputs[key][:actual_bs, :, :actual_out_len].clone()
+
+    def _maybe_log_stats(self) -> None:
+        """Log a snapshot of batched_decode path counters.
+
+        Fires every ``self._stats_log_interval`` calls, then clears counters.
+        The log exposes:
+          * how calls are split across fast (graph_hit) vs. slow
+            (per_request_loop) paths
+          * the top (bs, F) buckets that missed captured graphs
+          * the top (bs, F) buckets that hit captured graphs
+        """
+        if self._stats["calls"] < self._stats_log_interval:
+            return
+
+        total = self._stats["calls"]
+        pct = lambda n: f"{(100.0 * n / total):5.1f}%" if total else "  0.0%"
+        logger.info(
+            "[CUDAGraphDecoder] last %d batched_decode calls: "
+            "graph_hit=%d (%s), eager_small_bs=%d (%s), "
+            "per_request_loop=%d (%s), bs1_graph_via_batched=%d (%s), "
+            "eager_full_fallback=%d (%s)",
+            total,
+            self._stats["graph_hit"], pct(self._stats["graph_hit"]),
+            self._stats["eager_small_bs"], pct(self._stats["eager_small_bs"]),
+            self._stats["per_request_loop"], pct(self._stats["per_request_loop"]),
+            self._stats["bs1_graph_hit_via_batched"], pct(self._stats["bs1_graph_hit_via_batched"]),
+            self._stats["eager_full_fallback"], pct(self._stats["eager_full_fallback"]),
+        )
+        if self._miss_keys:
+            top_misses = sorted(self._miss_keys.items(), key=lambda kv: kv[1], reverse=True)[:10]
+            logger.info(
+                "[CUDAGraphDecoder] top fallback (padded_bs,padded_size) buckets: %s",
+                ", ".join(f"{k}:{v}" for k, v in top_misses),
+            )
+        if self._hit_keys:
+            top_hits = sorted(self._hit_keys.items(), key=lambda kv: kv[1], reverse=True)[:5]
+            logger.info(
+                "[CUDAGraphDecoder] top graph-hit (padded_bs,padded_size) buckets: %s",
+                ", ".join(f"{k}:{v}" for k, v in top_hits),
+            )
+
+        for k in self._stats:
+            self._stats[k] = 0
+        self._miss_keys.clear()
+        self._hit_keys.clear()
 
     def chunked_decode_with_cudagraph(
         self,

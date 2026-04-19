@@ -420,14 +420,20 @@ def test_grid_selects_streaming_sizes_for_multi_bs():
     for bs in [2, 4, 8, 16]:
         for s in [2, 4, 8, 16]:
             assert (bs, s) in multi_bs_pairs, f"missing IC bucket ({bs}, {s})"
-    # IC buckets AT OR ABOVE codec_chunk_frames (e.g. 32, 64 when chunk=25)
-    # must NOT be captured at bs>1: they're not actually hit during IC (chunk
-    # never exceeds codec_chunk_frames), and their activations blow up CUDA
-    # graph private-pool memory at high bs (observed OOM during warmup at
-    # bs=32, s=32 without this cap).
+    # IC-transition buckets (codec_chunk_frames <= s < primary; e.g. 32, 64
+    # when chunk=25, left=72, primary=97) MUST be captured at small bs. These
+    # are the "chunk N ramp-up" buckets: F=chunk+partial_left_context pads
+    # to 32 or 64 on the 2nd/3rd chunk of every request. If missing, Stage-1
+    # falls into the per-request bs=1 loop for 20%+ of calls.
     for bs in [2, 4, 8, 16]:
-        assert (bs, 32) not in multi_bs_pairs, f"unexpected IC bucket ({bs}, 32)"
-        assert (bs, 64) not in multi_bs_pairs, f"unexpected IC bucket ({bs}, 64)"
+        assert (bs, 32) in multi_bs_pairs, f"missing IC-transition bucket ({bs}, 32)"
+        assert (bs, 64) in multi_bs_pairs, f"missing IC-transition bucket ({bs}, 64)"
+    # IC-transition buckets MUST NOT be captured at large bs. At bs>=32 the
+    # activation memory of size=32/64 blows up the CUDA graph private pool
+    # and OOMs during warmup (observed on H100 80GB with 0.25 gpu_mem for
+    # stage-1). The ic_transition_cap_bs=16 guard keeps warmup safe.
+    assert (32, 32) not in multi_bs_pairs, "(32, 32) would OOM on warmup"
+    assert (32, 64) not in multi_bs_pairs, "(32, 64) would OOM on warmup"
     # And seq sizes at or above the steady-state primary (other than 97 and 25)
     # must NOT be captured at bs>1 — they're not part of the streaming hot path.
     assert (16, 325) not in multi_bs_pairs
