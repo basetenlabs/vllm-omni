@@ -1647,6 +1647,30 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
             sampling_params_list = copy.deepcopy(sampling_params_list)
             sampling_params_list[0].max_tokens = request.max_new_tokens
 
+        # Generic per-request sampling overrides (AR / talker stage only).
+        # These override the stage-config YAML for this request so clients can
+        # tune variance (temperature), reproducibility (seed), or penalty
+        # without restarting the server. Only stage index 0 (the AR stage) is
+        # affected; vocoder / code2wav stages keep their deterministic config.
+        sampling_overrides = {
+            "temperature": request.temperature,
+            "top_p": request.top_p,
+            "top_k": request.top_k,
+            "repetition_penalty": request.repetition_penalty,
+            "seed": request.seed,
+        }
+        if sampling_params_list and any(v is not None for v in sampling_overrides.values()):
+            import copy
+
+            # Only deepcopy once: if an earlier branch already cloned the list,
+            # mutating the same object is safe. Otherwise clone now so we
+            # don't scribble on the engine's shared defaults.
+            if sampling_params_list is self.engine_client.default_sampling_params_list:
+                sampling_params_list = copy.deepcopy(sampling_params_list)
+            for field, value in sampling_overrides.items():
+                if value is not None:
+                    setattr(sampling_params_list[0], field, value)
+
         generator = self.engine_client.generate(
             prompt=prompt,
             request_id=request_id,
@@ -1909,6 +1933,11 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
             x_vector_only_mode=_pick("x_vector_only_mode"),
             max_new_tokens=_pick("max_new_tokens"),
             initial_codec_chunk_frames=_pick("initial_codec_chunk_frames"),
+            temperature=_pick("temperature"),
+            top_p=_pick("top_p"),
+            top_k=_pick("top_k"),
+            repetition_penalty=_pick("repetition_penalty"),
+            seed=_pick("seed"),
         )
 
     async def create_speech_batch(

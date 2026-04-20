@@ -226,6 +226,11 @@ class OmniStreamingSpeechHandler:
             x_vector_only_mode=config.x_vector_only_mode,
             speaker_embedding=config.speaker_embedding,
             stream=config.stream_audio,
+            temperature=config.temperature,
+            top_p=config.top_p,
+            top_k=config.top_k,
+            repetition_penalty=config.repetition_penalty,
+            seed=config.seed,
         )
 
         start_payload = {

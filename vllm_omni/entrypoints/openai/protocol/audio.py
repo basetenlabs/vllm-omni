@@ -75,6 +75,44 @@ class OpenAICreateSpeechRequest(BaseModel):
         description="Per-request initial chunk size override. If null, computed dynamically based on server load.",
     )
 
+    # --- Per-request sampling overrides (AR / talker stage only) ---
+    # These override the `default_sampling_params` block of the stage-config
+    # YAML for this request only. The vocoder / code2wav stage is unaffected.
+    # All fields default to None, meaning "use the stage-config value".
+    temperature: float | None = Field(
+        default=None,
+        ge=0.0,
+        le=2.0,
+        description=(
+            "Sampling temperature for the AR stage. 0.0 = greedy (lowest "
+            "variance, may sound flatter). Stage-config default is used when unset."
+        ),
+    )
+    top_p: float | None = Field(
+        default=None,
+        gt=0.0,
+        le=1.0,
+        description="Nucleus sampling probability mass for the AR stage.",
+    )
+    top_k: int | None = Field(
+        default=None,
+        ge=-1,
+        description="Top-k sampling for the AR stage. -1 disables top-k.",
+    )
+    repetition_penalty: float | None = Field(
+        default=None,
+        gt=0.0,
+        description="Repetition penalty for the AR stage (1.0 = no penalty).",
+    )
+    seed: int | None = Field(
+        default=None,
+        description=(
+            "Per-request RNG seed for the AR stage. Pin this to reduce "
+            "variance across identical prompts. Note: batch numerics still "
+            "introduce some residual variance across different concurrency levels."
+        ),
+    )
+
     @field_validator("stream_format")
     @classmethod
     def validate_stream_format(cls, v: str) -> str:
@@ -149,6 +187,12 @@ class SpeechBatchItem(BaseModel):
     x_vector_only_mode: bool | None = None
     max_new_tokens: int | None = None
     initial_codec_chunk_frames: int | None = Field(default=None, ge=0)
+    # Per-request sampling overrides; when unset, the batch-level or stage-config value wins.
+    temperature: float | None = Field(default=None, ge=0.0, le=2.0)
+    top_p: float | None = Field(default=None, gt=0.0, le=1.0)
+    top_k: int | None = Field(default=None, ge=-1)
+    repetition_penalty: float | None = Field(default=None, gt=0.0)
+    seed: int | None = None
 
 
 class BatchSpeechRequest(BaseModel):
@@ -168,6 +212,12 @@ class BatchSpeechRequest(BaseModel):
     x_vector_only_mode: bool | None = None
     max_new_tokens: int | None = None
     initial_codec_chunk_frames: int | None = Field(default=None, ge=0)
+    # Batch-level sampling defaults; per-item values override these.
+    temperature: float | None = Field(default=None, ge=0.0, le=2.0)
+    top_p: float | None = Field(default=None, gt=0.0, le=1.0)
+    top_k: int | None = Field(default=None, ge=-1)
+    repetition_penalty: float | None = Field(default=None, gt=0.0)
+    seed: int | None = None
 
 
 class SpeechBatchItemResult(BaseModel):
@@ -224,6 +274,13 @@ class StreamingSpeechSessionConfig(BaseModel):
             "'clause' also splits on CJK commas ， and semicolons ；."
         ),
     )
+
+    # Per-session sampling overrides applied to every sentence in the stream.
+    temperature: float | None = Field(default=None, ge=0.0, le=2.0)
+    top_p: float | None = Field(default=None, gt=0.0, le=1.0)
+    top_k: int | None = Field(default=None, ge=-1)
+    repetition_penalty: float | None = Field(default=None, gt=0.0)
+    seed: int | None = None
 
     @model_validator(mode="after")
     def validate_streaming_constraints(self) -> "StreamingSpeechSessionConfig":
