@@ -1,0 +1,147 @@
+# Qwen3-TTS — TTFA-optimized profile
+#
+# Target operating point: ~25 concurrent streams, minimize TTFA while holding
+# acceptable throughput / RTF.
+#
+# TTFA is dominated by:
+#   1. Talker AR step time  (CUDA graphs + moderate batch width)
+#   2. initial_codec_chunk_frames  (talker steps before first code2wav prefill)
+#   3. Code2wav first-chunk prefill time  (smaller first chunk = smaller prefill)
+#
+# This config sizes the AR talker batch width for exactly the intended
+# concurrency (no wasted graph buckets above ~32), keeps the initial codec
+# chunk pinned at the minimum, and tightens connector timeouts so stalls
+# surface fast instead of dragging TTFA.
+#
+# Trade-offs vs qwen3_tts_high_concurrency.yaml:
+#   - Lower max_num_seqs / max_inflight (32/25 vs 64/64): cleaner per-step
+#     latency at the target load, no headroom for sudden bursts >32.
+#   - Smaller max_num_batched_tokens on the talker: faster prefill steps,
+#     slightly lower peak prefill throughput.
+#   - cudagraph capture tops out at bs=32 (not 64): graphs are only useful
+#     for batches we actually see.
+#   - Tighter connector_get_max_wait*: fail fast rather than absorb stalls.
+#
+# If you routinely run >25 concurrent, use qwen3_tts_high_concurrency.yaml.
+async_chunk: true
+stage_args:
+  - stage_id: 0
+    stage_type: llm
+    is_comprehension: true
+    runtime:
+      devices: "0"
+    engine_args:
+      model_stage: qwen3_tts
+      # Target concurrency is 25; 32 leaves a small headroom bucket without
+      # widening the AR decode batch beyond what keeps per-step latency low.
+      max_num_seqs: 32
+      model_arch: Qwen3TTSTalkerForConditionalGeneration
+      worker_type: ar
+      scheduler_cls: vllm_omni.core.sched.omni_ar_scheduler.OmniARScheduler
+      enforce_eager: false
+      trust_remote_code: true
+      async_scheduling: true
+      enable_prefix_caching: false
+      engine_output_type: latent
+      # Leaves ~10 GiB of headroom after Stage-1's 0.25 and the lazy-loaded
+      # speech tokenizer encoder (~hundreds of MB). Less KV than the
+      # high-concurrency profile since we only serve up to ~32 concurrent
+      # sequences at 4k ctx.
+      gpu_memory_utilization: 0.55
+      # Sized for prefill of ~32 concurrent requests with short prompts.
+      # Smaller than the high-concurrency profile (24576): faster prefill
+      # steps → better TTFA for newly arriving requests.
+      max_num_batched_tokens: 16384
+      max_model_len: 4096
+      # Dense capture around the target operating point (~25). Every bucket
+      # a request actually hits while ramping up (1..32) replays a captured
+      # graph. We intentionally do NOT capture above 32 — those graphs cost
+      # VRAM and slow warmup without benefit at this concurrency.
+      cudagraph_capture_sizes: [1, 2, 4, 6, 8, 10, 12, 14, 16, 18, 20, 22, 24, 26, 28, 32]
+      custom_process_next_stage_input_func: vllm_omni.model_executor.stage_input_processors.qwen3_tts.talker2code2wav_async_chunk
+    output_connectors:
+      to_stage_1: connector_of_shared_memory
+    default_sampling_params:
+      temperature: 0.9
+      top_k: 50
+      max_tokens: 4096
+      seed: 42
+      detokenize: false
+      repetition_penalty: 1.05
+      stop_token_ids: [2150]
+
+  - stage_id: 1
+    stage_type: llm
+    runtime:
+      devices: "0"
+    engine_args:
+      model_stage: code2wav
+      max_num_seqs: 32
+      model_arch: Qwen3TTSCode2Wav
+      worker_type: generation
+      scheduler_cls: vllm_omni.core.sched.omni_generation_scheduler.OmniGenerationScheduler
+      enforce_eager: true
+      trust_remote_code: true
+      async_scheduling: true
+      enable_prefix_caching: false
+      engine_output_type: audio
+      gpu_memory_utilization: 0.25
+      # Must be divisible by num_code_groups and cover (left_context + chunk).
+      # Prefill length is Q * num_frames (up to 16 * 2148 = 34368); keep
+      # headroom past 32k for the largest single-request prefill.
+      max_num_batched_tokens: 65536
+      max_model_len: 65536
+    engine_input_source: [0]
+    final_output: true
+    final_output_type: audio
+    input_connectors:
+      from_stage_0: connector_of_shared_memory
+    tts_args:
+      max_instructions_length: 500
+    default_sampling_params:
+      temperature: 0.0
+      top_p: 1.0
+      top_k: -1
+      max_tokens: 65536
+      seed: 42
+      detokenize: true
+      repetition_penalty: 1.0
+
+runtime:
+  enabled: true
+  defaults:
+    window_size: -1
+    # Hard-cap at the target concurrency. Requests above this queue in the
+    # entrypoint rather than inflating the AR batch and eroding per-step
+    # latency / TTFA for already-running streams.
+    max_inflight: 25
+
+  connectors:
+    connector_of_shared_memory:
+      name: SharedMemoryConnector
+      extra:
+        shm_threshold_bytes: 65536
+        codec_streaming: true
+        connector_get_sleep_s: 0.01
+        # First-chunk wait: tighter than the high-concurrency profile; at
+        # this load the first codec emission should arrive well under 2s.
+        connector_get_max_wait_first_chunk: 2000
+        # Subsequent-chunk wait: tight so stalled streams drop out instead
+        # of back-pressuring the scheduler and hurting TTFA for new arrivals.
+        connector_get_max_wait: 200
+        # Match the decoder sliding attention window to avoid chunk-boundary
+        # noise. Keep at 25 — TTFA is governed by initial_codec_chunk_frames;
+        # shrinking subsequent chunk size would only hurt RTF.
+        codec_chunk_frames: 25
+        codec_left_context_frames: 72
+        # Pin the initial codec chunk to the minimum. This is the single
+        # biggest TTFA lever: the talker must produce this many codec frames
+        # before code2wav can emit the first audio chunk. Leaving dynamic IC
+        # growth on would push this to 4/8/16 under load and visibly raise
+        # TTFA well before reaching the target concurrency.
+        initial_codec_chunk_frames: 2
+
+  edges:
+    - from: 0
+      to: 1
+      window_size: -1

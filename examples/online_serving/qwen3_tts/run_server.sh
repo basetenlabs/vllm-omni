@@ -2,13 +2,18 @@
 # Launch vLLM-Omni server for Qwen3-TTS models
 #
 # Usage:
-#   ./run_server.sh                                                        # Default: 1.7B CustomVoice
+#   ./run_server.sh                                                        # Default: 1.7B CustomVoice, ttfa profile
 #   ./run_server.sh CustomVoice                                            # 1.7B CustomVoice
 #   ./run_server.sh VoiceDesign 1.7B                                       # 1.7B VoiceDesign
 #   ./run_server.sh Base 0.6B                                              # 0.6B Base (voice clone)
 #   ./run_server.sh /path/to/local/model                                   # Local model directory
 #   SERVED_MODEL_NAME=my-tts ./run_server.sh                               # Custom served model name
-#   STAGE_CONFIGS_PATH=./my_qwen_stage_config.yaml ./run_server.sh         # Custom stage config
+#
+# Stage-config profiles (select with --profile, or set STAGE_CONFIGS_PATH directly):
+#   --profile ttfa                 # Low TTFA at ~25 concurrent streams (default)
+#   --profile ttfa_32              # Low TTFA at ~32 concurrent streams
+#   --profile high_concurrency     # Aggregate throughput at 32–64 concurrent streams
+#   STAGE_CONFIGS_PATH=./custom.yaml ./run_server.sh   # Arbitrary custom config
 #
 # Timestamps mode (word-level alignment via Qwen3-ForcedAligner-0.6B):
 #   ./run_server.sh --timestamps CustomVoice 1.7B
@@ -18,10 +23,26 @@
 set -e
 
 ENABLE_TIMESTAMPS=false
-if [ "$1" = "--timestamps" ]; then
-    ENABLE_TIMESTAMPS=true
-    shift
-fi
+PROFILE="${PROFILE:-ttfa}"
+while [ $# -gt 0 ]; do
+    case "$1" in
+        --timestamps)
+            ENABLE_TIMESTAMPS=true
+            shift
+            ;;
+        --profile)
+            PROFILE="$2"
+            shift 2
+            ;;
+        --profile=*)
+            PROFILE="${1#*=}"
+            shift
+            ;;
+        *)
+            break
+            ;;
+    esac
+done
 
 ARG="${1:-CustomVoice}"
 SIZE="${2:-1.7B}"
@@ -51,7 +72,26 @@ else
 fi
 
 SERVED_MODEL_NAME="${SERVED_MODEL_NAME:-}"
-STAGE_CONFIGS_PATH="${STAGE_CONFIGS_PATH:-vllm_omni/model_executor/stage_configs/qwen3_tts_latency.yaml}"
+
+if [ -z "${STAGE_CONFIGS_PATH:-}" ]; then
+    case "$PROFILE" in
+        ttfa|ttfa_25)
+            STAGE_CONFIGS_PATH="vllm_omni/model_executor/stage_configs/qwen3_tts_ttfa.yaml"
+            ;;
+        ttfa_32)
+            STAGE_CONFIGS_PATH="vllm_omni/model_executor/stage_configs/qwen3_tts_ttfa_32.yaml"
+            ;;
+        high_concurrency|hc)
+            STAGE_CONFIGS_PATH="vllm_omni/model_executor/stage_configs/qwen3_tts_high_concurrency.yaml"
+            ;;
+        *)
+            echo "Unknown profile: $PROFILE"
+            echo "Supported: ttfa (alias: ttfa_25), ttfa_32, high_concurrency (alias: hc)"
+            exit 1
+            ;;
+    esac
+fi
+echo "Using stage config: $STAGE_CONFIGS_PATH (profile=$PROFILE)"
 
 if [ "$ENABLE_TIMESTAMPS" = true ]; then
     export FORCED_ALIGNER_MODEL="${FORCED_ALIGNER_MODEL:-Qwen/Qwen3-ForcedAligner-0.6B}"

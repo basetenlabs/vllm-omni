@@ -1,3 +1,18 @@
+# Qwen3-TTS — HIGH-CONCURRENCY profile
+#
+# Tuned for sustained load at 32–64 concurrent streams. Maximizes aggregate
+# throughput (req/s and RTF) while holding TTFA roughly flat via a pinned
+# initial codec chunk. Use when the deployment is batching-bound and TTFA
+# p50 on the order of a few hundred ms is acceptable.
+#
+# For tight TTFA at lower concurrency, use qwen3_tts_ttfa.yaml instead.
+#
+# Key levers:
+#   - max_num_seqs / max_inflight = 64            (wide batches)
+#   - dense cudagraph capture up to bs=64         (hot AR step across all buckets)
+#   - max_num_batched_tokens = 24576 (talker)     (large prefill batches)
+#   - initial_codec_chunk_frames = 2 (pinned)     (TTFA guard at high conc)
+#   - codec_chunk_frames = 25                     (good useful-work ratio per decode)
 async_chunk: true
 stage_args:
   - stage_id: 0
