@@ -1,0 +1,155 @@
+# Qwen3-TTS — TTFA-optimized profile for ~32 concurrent streams, timestamps-compatible
+#
+# Same target operating point as qwen3_tts_ttfa_32.yaml (~32 concurrent,
+# TTFA-dominated), but with the per-stage memory footprint reduced to leave
+# headroom for the Qwen3-ForcedAligner-0.6B model running in the API server
+# process (used when the server is launched with --timestamps).
+#
+# Why a separate file:
+# - Qwen3-ForcedAligner-0.6B bf16 weights are ~1.3 GiB.
+# - One alignment forward pass for a ~15s utterance needs ~2–3 GiB of
+#   activations (varies with audio length and batch).
+# - Neither is counted inside `gpu_memory_utilization`, and the Stage-1
+#   code2wav `max_num_batched_tokens: 65536` also produces large prefill
+#   activations that exceed its utilization fraction in practice.
+# - On an 80 GB H100, the base ttfa_32 config (talker 0.60 + code2wav 0.25
+#   + weights + activations) leaves ~0 MiB free, which OOMs the aligner on
+#   its first real-length forward pass.
+#
+# Deltas vs qwen3_tts_ttfa_32.yaml:
+#   - talker gpu_memory_utilization: 0.60 -> 0.48  (~9.5 GiB freed)
+#   - code2wav gpu_memory_utilization: 0.25 -> 0.20 (~4 GiB freed)
+#   - cudagraph_capture_sizes: 15 -> 10 buckets   (~9 GiB freed in graph pools)
+#   - Total freed for aligner + overhead: ~22 GiB on an 80 GB GPU.
+#     CUDA graph private pools are ~1.8 GiB per captured batch size and are
+#     allocated OUTSIDE `gpu_memory_utilization`, so trimming them is the
+#     only way to bound process memory when the aligner co-resides on GPU 0.
+#     See the explanatory comment next to `cudagraph_capture_sizes` below.
+#   - Everything else (max_num_seqs, max_inflight, connector tuning,
+#     initial_codec_chunk_frames=2) is unchanged, so TTFA behavior at the
+#     target load should match ttfa_32 within measurement noise (requests
+#     at uncaptured batch sizes are routed to the next higher captured
+#     bucket via padding, which costs a tiny amount of wasted compute).
+#
+# Trade-offs:
+#   - Smaller talker KV budget: at 32 concurrent * 4k ctx the talker has
+#     tighter KV headroom. If you see preemption logs at this load, bump
+#     talker gpu_memory_utilization back toward 0.52 in 0.02 steps and
+#     verify aligner still has room (watch nvidia-smi for "free" > 3 GiB).
+#   - Code2wav at 0.20 still comfortably fits the 65k prefill for a single
+#     request since weights + activations already exceed the fractional
+#     budget; the KV pool is the only thing that actually shrinks.
+async_chunk: true
+stage_args:
+  - stage_id: 0
+    stage_type: llm
+    is_comprehension: true
+    runtime:
+      devices: "0"
+    engine_args:
+      model_stage: qwen3_tts
+      # Same concurrency target as ttfa_32 (32 with bucket up to 40).
+      max_num_seqs: 40
+      model_arch: Qwen3TTSTalkerForConditionalGeneration
+      worker_type: ar
+      scheduler_cls: vllm_omni.core.sched.omni_ar_scheduler.OmniARScheduler
+      enforce_eager: false
+      trust_remote_code: true
+      async_scheduling: true
+      enable_prefix_caching: false
+      engine_output_type: latent
+      # Lowered from 0.60 (ttfa_32) to free ~9.5 GiB on an 80 GB GPU for
+      # the ForcedAligner running in the API server process. KV is still
+      # large enough to hold 32 active sequences at 4k ctx without
+      # preemption under typical workloads; monitor for preemption logs
+      # under extended bursts.
+      gpu_memory_utilization: 0.48
+      max_num_batched_tokens: 20480
+      max_model_len: 4096
+      # Trimmed from 15 buckets (ttfa_32) to 10. Each captured graph owns a
+      # private memory pool of ~1.8 GiB on the 1.7B talker, and those pools
+      # are allocated on top of `gpu_memory_utilization` — they're the
+      # reason the talker process overshoots its KV budget. 15 buckets
+      # consume ~27 GiB of graph pools, which is enough to OOM the aligner.
+      # 10 buckets consume ~18 GiB.
+      #
+      # Coverage kept around the real operating range (24..40) plus a
+      # few ramp-up/ramp-down sizes. Requests at uncaptured batch sizes
+      # (e.g. bs=6, 10, 14) are rounded up to the next captured bucket via
+      # padding — a few percent of wasted compute, negligible at TTFA time
+      # compared to the aligner OOM this prevents.
+      cudagraph_capture_sizes: [1, 2, 4, 8, 16, 24, 28, 32, 36, 40]
+      custom_process_next_stage_input_func: vllm_omni.model_executor.stage_input_processors.qwen3_tts.talker2code2wav_async_chunk
+    output_connectors:
+      to_stage_1: connector_of_shared_memory
+    default_sampling_params:
+      temperature: 0.9
+      top_k: 50
+      max_tokens: 4096
+      seed: 42
+      detokenize: false
+      repetition_penalty: 1.05
+      stop_token_ids: [2150]
+
+  - stage_id: 1
+    stage_type: llm
+    runtime:
+      devices: "0"
+    engine_args:
+      model_stage: code2wav
+      max_num_seqs: 40
+      model_arch: Qwen3TTSCode2Wav
+      worker_type: generation
+      scheduler_cls: vllm_omni.core.sched.omni_generation_scheduler.OmniGenerationScheduler
+      enforce_eager: true
+      trust_remote_code: true
+      async_scheduling: true
+      enable_prefix_caching: false
+      engine_output_type: audio
+      # Lowered from 0.25 (ttfa_32) to free another ~4 GiB. Code2wav's real
+      # footprint is dominated by weights + prefill activations for
+      # max_num_batched_tokens=65536, which are allocated outside this
+      # fraction; shrinking the fraction mostly shrinks the KV pool, which
+      # is rarely the bottleneck for this stage in practice.
+      gpu_memory_utilization: 0.20
+      max_num_batched_tokens: 65536
+      max_model_len: 65536
+    engine_input_source: [0]
+    final_output: true
+    final_output_type: audio
+    input_connectors:
+      from_stage_0: connector_of_shared_memory
+    tts_args:
+      max_instructions_length: 500
+    default_sampling_params:
+      temperature: 0.0
+      top_p: 1.0
+      top_k: -1
+      max_tokens: 65536
+      seed: 42
+      detokenize: true
+      repetition_penalty: 1.0
+
+runtime:
+  enabled: true
+  defaults:
+    window_size: -1
+    max_inflight: 32
+
+  connectors:
+    connector_of_shared_memory:
+      name: SharedMemoryConnector
+      extra:
+        shm_threshold_bytes: 65536
+        codec_streaming: true
+        connector_get_sleep_s: 0.01
+        connector_get_max_wait_first_chunk: 2500
+        connector_get_max_wait: 250
+        codec_chunk_frames: 25
+        codec_left_context_frames: 72
+        initial_codec_chunk_frames: 2
+
+  edges:
+    - from: 0
+      to: 1
+      window_size: -1

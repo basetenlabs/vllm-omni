@@ -74,12 +74,24 @@ fi
 SERVED_MODEL_NAME="${SERVED_MODEL_NAME:-}"
 
 if [ -z "${STAGE_CONFIGS_PATH:-}" ]; then
+    # When --timestamps is set, the ForcedAligner model lives in the API
+    # server process and shares GPU 0 with the talker/code2wav. Swap to
+    # the timestamps-aware variant which leaves ~10+ GiB of headroom for
+    # the aligner's forward pass (prevents OOM at real audio lengths).
     case "$PROFILE" in
         ttfa|ttfa_25)
-            STAGE_CONFIGS_PATH="vllm_omni/model_executor/stage_configs/qwen3_tts_ttfa.yaml"
+            if [ "$ENABLE_TIMESTAMPS" = true ]; then
+                STAGE_CONFIGS_PATH="vllm_omni/model_executor/stage_configs/qwen3_tts_ttfa_timestamps.yaml"
+            else
+                STAGE_CONFIGS_PATH="vllm_omni/model_executor/stage_configs/qwen3_tts_ttfa.yaml"
+            fi
             ;;
         ttfa_32)
-            STAGE_CONFIGS_PATH="vllm_omni/model_executor/stage_configs/qwen3_tts_ttfa_32.yaml"
+            if [ "$ENABLE_TIMESTAMPS" = true ]; then
+                STAGE_CONFIGS_PATH="vllm_omni/model_executor/stage_configs/qwen3_tts_ttfa_32_timestamps.yaml"
+            else
+                STAGE_CONFIGS_PATH="vllm_omni/model_executor/stage_configs/qwen3_tts_ttfa_32.yaml"
+            fi
             ;;
         high_concurrency|hc)
             STAGE_CONFIGS_PATH="vllm_omni/model_executor/stage_configs/qwen3_tts_high_concurrency.yaml"
@@ -90,13 +102,30 @@ if [ -z "${STAGE_CONFIGS_PATH:-}" ]; then
             exit 1
             ;;
     esac
+
+    if [ "$ENABLE_TIMESTAMPS" = true ] && [ ! -f "$STAGE_CONFIGS_PATH" ]; then
+        echo "WARNING: timestamps-aware config $STAGE_CONFIGS_PATH not found; falling back to non-timestamps variant."
+        echo "         The aligner may OOM on first real-length forward pass. See TTFA config comments."
+        case "$PROFILE" in
+            ttfa|ttfa_25)  STAGE_CONFIGS_PATH="vllm_omni/model_executor/stage_configs/qwen3_tts_ttfa.yaml" ;;
+            ttfa_32)       STAGE_CONFIGS_PATH="vllm_omni/model_executor/stage_configs/qwen3_tts_ttfa_32.yaml" ;;
+        esac
+    fi
 fi
-echo "Using stage config: $STAGE_CONFIGS_PATH (profile=$PROFILE)"
+echo "Using stage config: $STAGE_CONFIGS_PATH (profile=$PROFILE, timestamps=$ENABLE_TIMESTAMPS)"
 
 if [ "$ENABLE_TIMESTAMPS" = true ]; then
     export FORCED_ALIGNER_MODEL="${FORCED_ALIGNER_MODEL:-Qwen/Qwen3-ForcedAligner-0.6B}"
     export FORCED_ALIGNER_DEVICE="${FORCED_ALIGNER_DEVICE:-cuda:0}"
     export FORCED_ALIGNER_DTYPE="${FORCED_ALIGNER_DTYPE:-bfloat16}"
+
+    # When the aligner co-resides on GPU 0 with the talker's CUDA graph
+    # pools and the code2wav KV pool, fragmentation between PyTorch's
+    # general allocator and the private graph pools can starve the
+    # aligner's forward allocation even when nominal free memory looks
+    # healthy. expandable_segments lets PyTorch grow segments dynamically
+    # instead of requiring contiguous blocks upfront.
+    export PYTORCH_ALLOC_CONF="${PYTORCH_ALLOC_CONF:-expandable_segments:True}"
 
     # Reserve GPU memory for the aligner model (~1GB in bf16)
     GPU_MEM_UTIL="${GPU_MEM_UTIL:-0.8}"
