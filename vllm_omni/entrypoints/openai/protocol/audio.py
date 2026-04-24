@@ -36,6 +36,24 @@ class OpenAICreateSpeechRequest(BaseModel):
             "Requires response_format='pcm'. Speed adjustment is not supported when streaming."
         ),
     )
+    timestamp_type: Literal["word"] | None = Field(
+        default=None,
+        description=(
+            "Enable timestamp alignment on the streaming response. 'word' returns "
+            "word-level start/end times via the Qwen3-ForcedAligner. Requires "
+            "stream=true, stream_format='sse', response_format='pcm', and the server "
+            "to have been started with FORCED_ALIGNER_MODEL set."
+        ),
+    )
+    timestamp_transport_strategy: Literal["sync", "async"] = Field(
+        default="sync",
+        description=(
+            "How timestamps are delivered alongside SSE audio. "
+            "'sync': timestamp_info is included on the speech.audio.done event. "
+            "'async': audio.done is sent first; a separate speech.timestamps event "
+            "arrives afterwards, reducing time-to-first-audio."
+        ),
+    )
 
     # Qwen3-TTS specific parameters
     task_type: Literal["CustomVoice", "VoiceDesign", "Base"] | None = Field(
@@ -75,13 +93,6 @@ class OpenAICreateSpeechRequest(BaseModel):
         description="Per-request initial chunk size override. If null, computed dynamically based on server load.",
     )
 
-    @field_validator("stream_format")
-    @classmethod
-    def validate_stream_format(cls, v: str) -> str:
-        if v == "sse":
-            raise ValueError("'sse' is not a supported stream_format yet. Please use 'audio'.")
-        return v
-
     @field_validator("speaker_embedding")
     @classmethod
     def validate_speaker_embedding(cls, v: list[float] | None) -> list[float] | None:
@@ -99,7 +110,13 @@ class OpenAICreateSpeechRequest(BaseModel):
     @model_validator(mode="after")
     def validate_streaming_constraints(self) -> "OpenAICreateSpeechRequest":
         if self.stream:
-            if self.response_format not in ("pcm", "wav"):
+            if self.stream_format == "sse":
+                if self.response_format != "pcm":
+                    raise ValueError(
+                        "SSE streaming (stream_format='sse') requires response_format='pcm'. "
+                        f"Got response_format='{self.response_format}'."
+                    )
+            elif self.response_format not in ("pcm", "wav"):
                 raise ValueError(
                     "Streaming (stream=true) requires response_format='pcm' or 'wav'. "
                     f"Got response_format='{self.response_format}'."
@@ -109,6 +126,24 @@ class OpenAICreateSpeechRequest(BaseModel):
             elif self.speed != 1.0:
                 raise ValueError(
                     "Speed adjustment is not supported when streaming (stream=true). Set speed=1.0 or omit it."
+                )
+        elif self.stream_format == "sse":
+            raise ValueError("stream_format='sse' requires stream=true.")
+
+        if self.timestamp_type is not None:
+            if not self.stream:
+                raise ValueError(
+                    "timestamp_type is only supported for streaming responses. Set stream=true."
+                )
+            if self.stream_format != "sse":
+                raise ValueError(
+                    "timestamp_type requires stream_format='sse' so timestamps can be delivered "
+                    "alongside audio. Set stream_format='sse'."
+                )
+            if self.response_format != "pcm":
+                raise ValueError(
+                    "timestamp_type requires response_format='pcm'. "
+                    f"Got response_format='{self.response_format}'."
                 )
         return self
 

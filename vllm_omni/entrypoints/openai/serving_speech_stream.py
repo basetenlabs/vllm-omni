@@ -69,7 +69,6 @@ import json
 from contextlib import aclosing
 from typing import Any
 
-import numpy as np
 from fastapi import WebSocket, WebSocketDisconnect
 from pydantic import ValidationError
 from starlette.datastructures import Headers, UploadFile
@@ -85,6 +84,11 @@ from vllm_omni.entrypoints.openai.text_splitter import (
     SPLIT_CLAUSE,
     SPLIT_SENTENCE,
     SentenceSplitter,
+)
+from vllm_omni.entrypoints.openai.timestamp_utils import (
+    decode_audio_to_pcm as _decode_audio_to_pcm,
+    offset_timestamps as _offset_timestamps,
+    pcm_bytes_to_float32 as _pcm_bytes_to_float32,
 )
 
 logger = init_logger(__name__)
@@ -686,38 +690,3 @@ class _PendingAlignment:
         self.audio_offset = audio_offset
 
 
-def _offset_timestamps(ts_info: dict[str, Any], offset: float) -> None:
-    """Shift all word timestamps by *offset* seconds (in-place).
-
-    This makes per-sentence timestamps global, so they refer to positions
-    in the full concatenated audio stream.
-    """
-    if offset == 0.0:
-        return
-    wa = ts_info.get("word_alignment")
-    if not wa:
-        return
-    wa["word_start_times_seconds"] = [
-        round(t + offset, 4) for t in wa["word_start_times_seconds"]
-    ]
-    wa["word_end_times_seconds"] = [
-        round(t + offset, 4) for t in wa["word_end_times_seconds"]
-    ]
-
-
-def _pcm_bytes_to_float32(pcm_bytes: bytes) -> np.ndarray:
-    """Convert raw 16-bit signed PCM bytes to float32 numpy array in [-1, 1]."""
-    return np.frombuffer(pcm_bytes, dtype=np.int16).astype(np.float32) / 32768.0
-
-
-def _decode_audio_to_pcm(audio_bytes: bytes, response_format: str) -> bytes:
-    """Decode encoded audio (WAV, FLAC, …) to raw 16-bit PCM bytes.
-
-    For ``pcm`` format the bytes are returned as-is.
-    """
-    if response_format == "pcm":
-        return audio_bytes
-    import soundfile as sf
-
-    audio_np, _sr = sf.read(io.BytesIO(audio_bytes), dtype="int16")
-    return audio_np.tobytes()

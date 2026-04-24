@@ -34,6 +34,9 @@ from vllm_omni.entrypoints.openai.protocol.audio import (
     SpeechBatchItem,
     SpeechBatchItemResult,
 )
+from vllm_omni.entrypoints.openai.timestamp_utils import (
+    pcm_bytes_to_float32,
+)
 from vllm_omni.model_executor.models.fish_speech.prompt_utils import (
     build_fish_text_only_prompt_ids,
     estimate_fish_voice_clone_prompt_len_from_normalized,
@@ -177,6 +180,7 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
         instance._diffusion_engine = diffusion_engine
         instance._diffusion_model_name = model_name
         instance._diffusion_stage_configs = stage_configs
+        instance.forced_aligner = None
         return instance
 
     def __init__(self, *args, **kwargs):
@@ -234,6 +238,11 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
         self._build_voxtral_prompt_async = make_async(self._build_voxtral_prompt, executor=self._tts_executor)
         self._build_fish_speech_prompt_async = make_async(self._build_fish_speech_prompt, executor=self._tts_executor)
         self._estimate_prompt_len_async = make_async(self._estimate_prompt_len, executor=self._tts_executor)
+
+        # Optional forced aligner for word-level timestamp alignment on
+        # streaming responses. Populated by the API server on startup when
+        # FORCED_ALIGNER_MODEL is set; remains None otherwise.
+        self.forced_aligner: Any = None
 
     def _load_codec_frame_rate(self) -> float | None:
         """Load codec frame rate from speech tokenizer config for prompt length estimation."""
@@ -1653,6 +1662,114 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
         async for chunk in self._generate_audio_chunks(generator, request_id, response_format="pcm"):
             yield chunk
 
+    async def _generate_sse_stream(
+        self,
+        request: OpenAICreateSpeechRequest,
+        request_id: str,
+        generator,
+    ):
+        """Yield SSE events carrying base64 PCM deltas and optional word timestamps.
+
+        Event shape::
+
+            data: {"type": "speech.audio.start", "format": "pcm", "sample_rate": 24000}
+            data: {"type": "speech.audio.delta", "audio": "<base64 pcm>"}
+            ...
+            data: {"type": "speech.audio.done", "total_bytes": N,
+                   "timestamp_info": {...}?}          # timestamp_info present in sync mode
+            data: {"type": "speech.timestamps", "timestamp_info": {...}}  # async mode only
+            data: [DONE]
+
+        ``request_id`` and ``generator`` are produced by
+        ``_prepare_speech_generation``.
+        """
+        sample_rate = 24000
+
+        timestamps_enabled = request.timestamp_type is not None
+        ts_sync = timestamps_enabled and request.timestamp_transport_strategy == "sync"
+        ts_async = timestamps_enabled and request.timestamp_transport_strategy == "async"
+
+        def _event(payload: dict[str, Any]) -> str:
+            return f"data: {json.dumps(payload, ensure_ascii=False)}\n\n"
+
+        yield _event({
+            "type": "speech.audio.start",
+            "format": "pcm",
+            "sample_rate": sample_rate,
+            "request_id": request_id,
+        })
+
+        total_bytes = 0
+        pcm_buffers: list[bytes] = []
+        generation_failed = False
+
+        try:
+            async for chunk in self._generate_audio_chunks(generator, request_id, response_format="pcm"):
+                total_bytes += len(chunk)
+                if timestamps_enabled:
+                    pcm_buffers.append(chunk)
+                yield _event({
+                    "type": "speech.audio.delta",
+                    "audio": base64.b64encode(chunk).decode("ascii"),
+                })
+        except asyncio.CancelledError:
+            logger.info("SSE speech request %s cancelled by client", request_id)
+            raise
+        except Exception as e:  # noqa: BLE001
+            generation_failed = True
+            logger.exception("SSE speech generation failed for %s: %s", request_id, e)
+            yield _event({
+                "type": "error",
+                "message": f"Speech generation failed: {e}",
+            })
+
+        # Sync-mode alignment happens before audio.done so the client sees
+        # timestamp_info on the same event it uses to know streaming is over.
+        timestamp_info: dict[str, Any] | None = None
+        if ts_sync and not generation_failed and pcm_buffers:
+            try:
+                audio_np = pcm_bytes_to_float32(b"".join(pcm_buffers))
+                timestamp_info = await self.forced_aligner.align(
+                    audio=audio_np,
+                    sample_rate=sample_rate,
+                    text=request.input,
+                    language=request.language or "Auto",
+                )
+            except Exception as e:  # noqa: BLE001
+                logger.error("Sync timestamp alignment failed for %s: %s", request_id, e)
+
+        done_payload: dict[str, Any] = {
+            "type": "speech.audio.done",
+            "total_bytes": total_bytes,
+            "error": generation_failed,
+        }
+        if timestamp_info is not None:
+            done_payload["timestamp_info"] = timestamp_info
+        yield _event(done_payload)
+
+        # Async-mode alignment runs after audio.done to minimize TTFA.
+        if ts_async and not generation_failed and pcm_buffers:
+            try:
+                audio_np = pcm_bytes_to_float32(b"".join(pcm_buffers))
+                ts_info = await self.forced_aligner.align(
+                    audio=audio_np,
+                    sample_rate=sample_rate,
+                    text=request.input,
+                    language=request.language or "Auto",
+                )
+                yield _event({
+                    "type": "speech.timestamps",
+                    "timestamp_info": ts_info,
+                })
+            except Exception as e:  # noqa: BLE001
+                logger.error("Async timestamp alignment failed for %s: %s", request_id, e)
+                yield _event({
+                    "type": "speech.timestamps",
+                    "error": str(e),
+                })
+
+        yield "data: [DONE]\n\n"
+
     async def _iter_pcm_audio_bytes(self, request: OpenAICreateSpeechRequest):
         """Yield raw PCM bytes for a speech request as soon as chunks are decoded."""
         request_id, generator, _ = await self._prepare_speech_generation(request)
@@ -1837,8 +1954,34 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
             if request.stream:
                 # Determine response format and media type for streaming
                 response_format = (request.response_format or "wav").lower()
+                stream_format = request.stream_format or "audio"
 
-                # Only pcm and wav support streaming without post-processing
+                if stream_format == "sse":
+                    # SSE transport carries base64 PCM deltas and optionally
+                    # word-level timestamp events; required when timestamps
+                    # are requested on the HTTP streaming path.
+                    if response_format != "pcm":
+                        return self.create_error_response(
+                            "SSE streaming (stream_format='sse') requires response_format='pcm'. "
+                            f"Got '{response_format}'."
+                        )
+                    if request.timestamp_type is not None and self.forced_aligner is None:
+                        return self.create_error_response(
+                            "Timestamps requested (timestamp_type='word') but no ForcedAligner is "
+                            "loaded. Start the server with FORCED_ALIGNER_MODEL set."
+                        )
+                    if request.speed is not None and request.speed != 1.0:
+                        return self.create_error_response(
+                            "Streaming is not supported with speed adjustment. "
+                            "Use stream=False or remove the speed parameter."
+                        )
+                    request_id, generator, _ = await self._prepare_speech_generation(request)
+                    return StreamingResponse(
+                        self._generate_sse_stream(request, request_id, generator),
+                        media_type="text/event-stream",
+                    )
+
+                # Only pcm and wav support raw binary streaming without post-processing
                 if response_format not in ["pcm", "wav"]:
                     return self.create_error_response(
                         f"Streaming is only supported for 'pcm' and 'wav' formats. "

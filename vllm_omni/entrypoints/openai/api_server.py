@@ -821,6 +821,9 @@ async def omni_init_app_state(
     )
 
     forced_aligner = create_aligner_from_env()
+    # Share the aligner instance with the HTTP speech service so that SSE
+    # streaming can produce word timestamps via the same model.
+    state.openai_serving_speech.forced_aligner = forced_aligner
     state.openai_streaming_speech = OmniStreamingSpeechHandler(
         speech_service=state.openai_serving_speech,
         forced_aligner=forced_aligner,

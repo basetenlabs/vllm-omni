@@ -338,6 +338,9 @@ Returns binary audio data with appropriate `Content-Type` header (e.g., `audio/w
 | `max_new_tokens`             | int    | 2048          | Maximum tokens to generate                                                                                           |
 | `initial_codec_chunk_frames` | int    | null          | Per-request initial chunk size override for TTFA tuning. When null, IC is computed dynamically based on server load. |
 | `stream`                     | bool   | false         | Stream raw PCM chunks as they are decoded (requires `response_format="pcm"`)                                         |
+| `stream_format`              | string | "audio"       | Streaming transport: `"audio"` for raw binary, `"sse"` for Server-Sent Events with base64 deltas and timestamps.    |
+| `timestamp_type`             | string | null          | Set to `"word"` to receive word-level timestamps alongside audio (requires `stream=true`, `stream_format="sse"`, `response_format="pcm"`, and `FORCED_ALIGNER_MODEL`). |
+| `timestamp_transport_strategy` | string | "sync"      | `"sync"`: timestamps on `speech.audio.done`. `"async"`: timestamps on a later `speech.timestamps` event (lower TTFA). |
 
 **Supported languages:** Auto, Chinese, English, Japanese, Korean, German, French, Russian, Portuguese, Spanish, Italian
 
@@ -370,6 +373,59 @@ curl -X POST http://localhost:8091/v1/audio/speech \
 - `stream=true` requires `response_format="pcm"` (raw 16-bit signed PCM, 24 kHz mono).
 - `speed` adjustment is not supported when streaming.
 - Requires the server stage config to have `async_chunk: true` (default in `qwen3_tts.yaml`).
+
+### Streaming with Word Timestamps (SSE)
+
+Setting `stream_format="sse"` switches the response from raw binary audio to a Server-Sent Events
+stream carrying base64-encoded PCM deltas. When `timestamp_type="word"` is also set, the server
+runs word-level forced alignment and returns `timestamp_info` on the same stream.
+
+Start the server with the aligner enabled:
+
+```bash
+FORCED_ALIGNER_MODEL=Qwen/Qwen3-ForcedAligner-0.6B \
+    python -m vllm_omni.entrypoints.openai.api_server \
+    --model Qwen/Qwen3-TTS-12Hz-0.6B-CustomVoice --stage-configs-path ...
+```
+
+Request (sync transport — timestamps on `speech.audio.done`):
+
+```bash
+curl -N -X POST http://localhost:8091/v1/audio/speech \
+    -H "Content-Type: application/json" \
+    -d '{
+        "input": "Hello, how are you?",
+        "voice": "vivian",
+        "language": "English",
+        "stream": true,
+        "stream_format": "sse",
+        "response_format": "pcm",
+        "timestamp_type": "word"
+    }'
+```
+
+Event sequence:
+
+```jsonc
+data: {"type": "speech.audio.start", "format": "pcm", "sample_rate": 24000, "request_id": "speech-..."}
+data: {"type": "speech.audio.delta", "audio": "<base64 PCM>"}
+// ... more speech.audio.delta events ...
+data: {"type": "speech.audio.done", "total_bytes": 96000, "error": false,
+       "timestamp_info": {"word_alignment": {"words": ["Hello,", "how", "are", "you?"],
+                                              "word_start_times_seconds": [0.0, 0.28, 0.52, 0.74],
+                                              "word_end_times_seconds": [0.28, 0.52, 0.74, 1.10]}}}
+data: [DONE]
+```
+
+With `"timestamp_transport_strategy": "async"` the `speech.audio.done` event arrives without
+`timestamp_info`, and a `speech.timestamps` event follows after all audio has been delivered.
+This minimizes time-to-first-audio at the cost of delivering timestamps later.
+
+**Constraints:**
+- `stream_format="sse"` requires `response_format="pcm"`.
+- `timestamp_type="word"` requires `stream=true`, `stream_format="sse"`, `response_format="pcm"`,
+  and the server to have been started with `FORCED_ALIGNER_MODEL` set.
+- The aligner is currently optimized for Qwen3-TTS outputs and English/CJK text.
 
 ## Streaming Text Input (WebSocket)
 
