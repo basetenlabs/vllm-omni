@@ -252,6 +252,15 @@ class OmniStreamingSpeechHandler:
                             "total_sentences": sentence_index,
                         }
                     )
+                    # Send a clean WS close frame so well-behaved clients see
+                    # a normal closure instead of a bare TCP shutdown.
+                    try:
+                        await websocket.close(code=1000)
+                    except Exception:
+                        logger.debug(
+                            "Failed to close streaming speech websocket cleanly",
+                            exc_info=True,
+                        )
                     return
 
                 elif msg_type in _VOICE_MSG_TYPES:
