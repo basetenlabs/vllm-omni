@@ -277,6 +277,80 @@ class StreamingSpeechSessionConfig(BaseModel):
         ),
     )
 
+    # ------------------------------------------------------------------
+    # Asymmetric chunking (opt-in, low-TTFA mode)
+    # ------------------------------------------------------------------
+    asymmetric_chunking: bool = Field(
+        default=False,
+        description=(
+            "Enable two-phase chunking: emit a small lead chunk as soon as "
+            "viable for low TTFA, then switch to larger 'steady' chunks for "
+            "stable prosody. Ignores 'split_granularity' when true."
+        ),
+    )
+    lead_min_chars: int = Field(
+        default=32,
+        ge=1,
+        le=500,
+        description=(
+            "Minimum characters before a lead chunk may be cut at a clause "
+            "boundary or whitespace. Sentence-final cuts ignore this floor."
+        ),
+    )
+    lead_max_wait_ms: int = Field(
+        default=300,
+        ge=0,
+        le=5000,
+        description=(
+            "Timer fallback: max ms to wait for a preferred boundary after "
+            "the first text bytes arrive before force-flushing the lead "
+            "chunk. Set to 0 to disable the timer fallback."
+        ),
+    )
+    lead_boundary: Literal["sentence", "clause"] = Field(
+        default="clause",
+        description=(
+            "Preferred boundary class for the lead chunk once 'lead_min_chars' "
+            "is met. Sentence boundaries are always tried first regardless."
+        ),
+    )
+    lead_initial_codec_chunk_frames: int | None = Field(
+        default=None,
+        ge=0,
+        description=(
+            "Override 'initial_codec_chunk_frames' for the lead chunk only. "
+            "Recommended low value (e.g. 3-8) to minimize TTFA without "
+            "affecting later chunks' chunking behavior."
+        ),
+    )
+    steady_units_per_chunk: int = Field(
+        default=1,
+        ge=1,
+        le=10,
+        description=(
+            "Number of complete sentences grouped per steady-phase chunk. "
+            "Larger values improve mid-utterance prosody at the cost of "
+            "per-chunk synthesis time and failure blast radius."
+        ),
+    )
+    steady_paragraph_break: bool = Field(
+        default=True,
+        description=(
+            "If true, treat double-newline ('\\n\\n') as an immediate steady "
+            "chunk boundary regardless of 'steady_units_per_chunk'."
+        ),
+    )
+    prefetch_lookahead: int = Field(
+        default=1,
+        ge=0,
+        le=4,
+        description=(
+            "How many chunks to synthesize in parallel beyond the one "
+            "currently being sent over the wire. 0 disables prefetch "
+            "(serial generation)."
+        ),
+    )
+
     @model_validator(mode="after")
     def validate_streaming_constraints(self) -> "StreamingSpeechSessionConfig":
         if self.stream_audio:
@@ -289,4 +363,9 @@ class StreamingSpeechSessionConfig(BaseModel):
                 self.speed = 1.0
             elif self.speed != 1.0:
                 raise ValueError("Speed adjustment is not supported when stream_audio=true. Set speed=1.0 or omit it.")
+        if self.asymmetric_chunking and self.prefetch_lookahead > 0 and not self.stream_audio:
+            # Prefetch with non-streaming chunks would buffer entire audio
+            # bytes per chunk in memory — allowed but warn-worthy. We still
+            # accept it; the handler simply pipelines bytes-mode jobs.
+            pass
         return self

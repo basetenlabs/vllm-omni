@@ -2,7 +2,13 @@
 
 import pytest
 
-from vllm_omni.entrypoints.openai.text_splitter import SentenceSplitter
+from vllm_omni.entrypoints.openai.text_splitter import (
+    SPLIT_CLAUSE,
+    SPLIT_SENTENCE,
+    AsymmetricSplitter,
+    SentenceSplitter,
+    StreamChunk,
+)
 
 pytestmark = [pytest.mark.openai, pytest.mark.speech, pytest.mark.core_model, pytest.mark.cpu]
 
@@ -251,3 +257,129 @@ class TestSentenceSplitterBufferLimit:
         # One more char should exceed the limit
         with pytest.raises(ValueError, match="exceeded maximum size"):
             splitter.add_text("xx")
+
+
+class TestAsymmetricSplitterLeadPhase:
+    """Lead phase emits the very first synthesizable unit ASAP."""
+
+    def test_lead_emits_on_sentence_boundary_below_min_chars(self):
+        # Sentence boundaries always win, regardless of lead_min_chars.
+        sp = AsymmetricSplitter(lead_min_chars=100)
+        chunks = sp.add_text("Hi. ")
+        assert len(chunks) == 1
+        assert chunks[0] == StreamChunk(text="Hi.", is_lead=True)
+        assert sp.lead_emitted is True
+
+    def test_lead_waits_for_min_chars_with_clause(self):
+        sp = AsymmetricSplitter(lead_min_chars=20)
+        # Below min_chars and only a clause-style break: keep buffering.
+        assert sp.add_text("Well, ") == []
+        assert sp.lead_emitted is False
+        # Cross min_chars and now have a clause boundary.
+        chunks = sp.add_text("now we are getting somewhere, ")
+        assert chunks and chunks[0].is_lead
+        assert chunks[0].text.startswith("Well, ")
+
+    def test_lead_falls_back_to_whitespace_after_min_chars(self):
+        sp = AsymmetricSplitter(lead_min_chars=20)
+        # No punctuation at all but enough chars + a whitespace.
+        chunks = sp.add_text("aaaaa bbbbb ccccc ddddd eeeee fffff")
+        assert chunks
+        assert chunks[0].is_lead
+        # Should cut at a whitespace, leaving the trailing word in buffer.
+        assert sp.buffer.strip() != ""
+
+    def test_force_lead_flush_emits_buffered_text(self):
+        sp = AsymmetricSplitter(lead_min_chars=100)
+        sp.add_text("the LLM has only emitted a fragment so far")
+        forced = sp.force_lead_flush()
+        assert forced is not None and forced.is_lead
+        assert "fragment" in forced.text or "fragment" in (sp.buffer + forced.text)
+
+    def test_force_lead_flush_noop_after_lead_emitted(self):
+        sp = AsymmetricSplitter()
+        sp.add_text("Hello world. ")
+        assert sp.lead_emitted
+        assert sp.force_lead_flush() is None
+
+
+class TestAsymmetricSplitterSteadyPhase:
+    """Steady phase emits grouped sentences after the lead is out."""
+
+    def test_steady_groups_sentences(self):
+        sp = AsymmetricSplitter(steady_units_per_chunk=2)
+        # Lead first.
+        lead_chunks = sp.add_text("Hi. ")
+        assert lead_chunks[0].is_lead
+        # Now feed three sentences. Steady should emit one chunk of 2,
+        # carry one for next.
+        chunks = sp.add_text("One. Two. Three. ")
+        assert [c.is_lead for c in chunks] == [False]
+        assert chunks[0].text == "One. Two."
+        # Force the carry out via flush.
+        tail = sp.flush()
+        assert tail is not None and not tail.is_lead
+        assert tail.text == "Three."
+
+    def test_steady_paragraph_break_flushes_carry(self):
+        sp = AsymmetricSplitter(steady_units_per_chunk=5)
+        # Lead.
+        sp.add_text("Hi. ")
+        # Two sentences that would be carried since 5 > 2.
+        chunks = sp.add_text("First. Second.\n\n")
+        # Paragraph break emits everything seen so far as a steady chunk.
+        steady = [c for c in chunks if not c.is_lead]
+        assert steady, f"expected steady chunk on paragraph break, got {chunks}"
+        joined = " ".join(c.text for c in steady)
+        assert "First." in joined and "Second." in joined
+
+    def test_lead_picks_earliest_boundary_cjk(self):
+        # CJK commas ， are clause boundaries in SPLIT_CLAUSE. With min_chars
+        # met, the lead should cut at the earliest comma, before the period.
+        sp = AsymmetricSplitter(
+            lead_min_chars=4,
+            lead_boundary_re=SPLIT_CLAUSE,
+        )
+        chunks = sp.add_text("从前，有一个国王。")
+        assert chunks[0].is_lead
+        assert chunks[0].text.endswith("，")
+        # Remaining sentence should be available after the lead.
+        more = sp.add_text("")
+        # The steady phase needs a flush to drain since no more boundaries arrive.
+        tail = sp.flush()
+        assert tail is None or "国王。" in tail.text or "国王" in tail.text
+
+    def test_lead_below_min_chars_only_sentence_boundary_fires(self):
+        sp = AsymmetricSplitter(lead_min_chars=50)
+        # CJK comma alone won't fire below min_chars.
+        assert sp.add_text("从前，") == []
+        # Sentence-final does.
+        chunks = sp.add_text("有一个国王。")
+        assert chunks and chunks[0].is_lead
+        assert "国王" in chunks[0].text
+
+
+class TestAsymmetricSplitterFlushAndEmpty:
+    def test_flush_lead_when_no_text_seen(self):
+        sp = AsymmetricSplitter()
+        assert sp.flush() is None
+
+    def test_flush_marks_remaining_as_lead_if_never_emitted(self):
+        sp = AsymmetricSplitter()
+        sp.add_text("only a tiny fragment with no boundary")
+        out = sp.flush()
+        assert out is not None
+        assert out.is_lead is True
+        assert "fragment" in out.text
+
+    def test_empty_text_does_not_advance_state(self):
+        sp = AsymmetricSplitter()
+        assert sp.add_text("") == []
+        assert sp.lead_emitted is False
+        assert sp.has_pending_text is False
+
+    def test_invalid_init_raises(self):
+        with pytest.raises(ValueError):
+            AsymmetricSplitter(lead_min_chars=0)
+        with pytest.raises(ValueError):
+            AsymmetricSplitter(steady_units_per_chunk=0)

@@ -463,6 +463,45 @@ Server -> Client:
 {"type": "session.done", "total_sentences": 1}
 ```
 
+### Asymmetric chunking (low-TTFA mode)
+
+When the upstream text producer is itself streaming (e.g. an LLM), splitting at every sentence boundary can produce uneven pacing because each sentence becomes its own synthesis job with its own phrase-final intonation. **Asymmetric chunking** addresses this by treating the very first chunk differently from later chunks:
+
+- **Lead chunk**: emit the *first* synthesizable unit as soon as possible — a sentence boundary anywhere, or a clause boundary / whitespace once a small character minimum is met. A timer fallback force-flushes the lead even if no boundary appears within `lead_max_wait_ms`. The lead can also pin a smaller `initial_codec_chunk_frames` for that one request only, further trimming TTFA.
+- **Steady chunks**: after the lead is out, accumulate larger spans (one or more complete sentences, or up to a paragraph break `\n\n`) for more stable mid-utterance prosody.
+- **Prefetch**: with `prefetch_lookahead > 0`, the next chunk's synthesis runs in parallel with the current chunk's on-the-wire delivery, so playback is bridged by the queue instead of silence at seams.
+
+Enable via `session.config` (all fields are opt-in and ignored by the classic path):
+
+```jsonc
+{
+  "type": "session.config",
+  "voice": "Vivian",
+  "task_type": "CustomVoice",
+  "stream_audio": true,
+  "response_format": "pcm",
+
+  "asymmetric_chunking": true,
+  "lead_min_chars": 32,
+  "lead_max_wait_ms": 300,
+  "lead_boundary": "clause",
+  "lead_initial_codec_chunk_frames": 5,
+  "steady_units_per_chunk": 2,
+  "steady_paragraph_break": true,
+  "prefetch_lookahead": 1
+}
+```
+
+Server frames are unchanged except that `audio.start` carries an additional `is_lead` boolean so clients can distinguish the lead chunk if desired.
+
+**Tuning notes:**
+
+- `lead_min_chars` is the floor for clause / whitespace cuts. Sentence-final cuts ignore it, so a clean short sentence like "Hi." always goes out fast.
+- `lead_max_wait_ms = 0` disables the timer fallback (only boundary-driven flushes will fire the lead).
+- `lead_initial_codec_chunk_frames` overrides only the lead's codec chunking; later chunks use the stage default. Recommended values are small (e.g. 3–8).
+- `steady_units_per_chunk` larger than 1 reduces the number of seams across the rest of the answer, at the cost of per-chunk synthesis latency. Pair with `prefetch_lookahead >= 1` to hide that cost.
+- `lead_boundary = "clause"` only differs from `"sentence"` for CJK punctuation (`，`, `；`, etc.) given the current splitter rules.
+
 ## Limitations
 
 - **Single request**: Batch processing is not yet optimized for online serving.

@@ -83,7 +83,9 @@ from vllm_omni.entrypoints.openai.serving_speech import OmniOpenAIServingSpeech
 from vllm_omni.entrypoints.openai.text_splitter import (
     SPLIT_CLAUSE,
     SPLIT_SENTENCE,
+    AsymmetricSplitter,
     SentenceSplitter,
+    StreamChunk,
 )
 from vllm_omni.entrypoints.openai.timestamp_utils import (
     decode_audio_to_pcm as _decode_audio_to_pcm,
@@ -169,111 +171,12 @@ class OmniStreamingSpeechHandler:
                     await self._send_error(websocket, str(error))
                     return
 
-            boundary_re = SPLIT_CLAUSE if config.split_granularity == "clause" else SPLIT_SENTENCE
-            splitter = SentenceSplitter(boundary_re=boundary_re)
-            sentence_index = 0
+            if config.asymmetric_chunking:
+                await self._run_asymmetric_session(websocket, config)
+                return
 
-            ts_async = (
-                timestamps_enabled
-                and config.timestamp_transport_strategy == "async"
-            )
-            # For async timestamp mode, queue alignment work for after all
-            # audio has been sent.
-            pending_alignments: list[_PendingAlignment] = []
-
-            # Running offset so timestamps are global across the full
-            # concatenated audio stream rather than per-sentence.
-            audio_offset: float = 0.0
-
-            # 2. Receive text chunks until input.done (voice.* also accepted)
-            while True:
-                try:
-                    raw = await asyncio.wait_for(
-                        websocket.receive_text(),
-                        timeout=self._idle_timeout,
-                    )
-                except asyncio.TimeoutError:
-                    await self._send_error(websocket, "Idle timeout: no message received")
-                    return
-
-                try:
-                    msg = json.loads(raw)
-                except json.JSONDecodeError:
-                    await self._send_error(websocket, "Invalid JSON message")
-                    continue
-
-                if not isinstance(msg, dict):
-                    await self._send_error(websocket, "WebSocket messages must be JSON objects")
-                    continue
-
-                msg_type = msg.get("type")
-
-                if msg_type == "input.text":
-                    if len(raw) > _MAX_INPUT_TEXT_MESSAGE_SIZE:
-                        await self._send_error(websocket, "input.text message too large")
-                        continue
-                    text = msg.get("text", "")
-                    if not isinstance(text, str):
-                        await self._send_error(websocket, "input.text requires a string value")
-                        continue
-                    sentences = splitter.add_text(text)
-                    for sentence in sentences:
-                        pa, duration = await self._generate_and_send(
-                            websocket, config, sentence, sentence_index,
-                            audio_offset=audio_offset,
-                        )
-                        audio_offset += duration
-                        if pa is not None:
-                            pending_alignments.append(pa)
-                        sentence_index += 1
-
-                elif msg_type == "input.done":
-                    remaining = splitter.flush()
-                    if remaining:
-                        pa, duration = await self._generate_and_send(
-                            websocket, config, remaining, sentence_index,
-                            audio_offset=audio_offset,
-                        )
-                        audio_offset += duration
-                        if pa is not None:
-                            pending_alignments.append(pa)
-                        sentence_index += 1
-
-                    # Async timestamps: run alignment on all stored audio
-                    # and send results before session.done.
-                    if ts_async and pending_alignments:
-                        await self._flush_async_timestamps(
-                            websocket, config, pending_alignments,
-                        )
-
-                    await websocket.send_json(
-                        {
-                            "type": "session.done",
-                            "total_sentences": sentence_index,
-                        }
-                    )
-                    # Send a clean WS close frame so well-behaved clients see
-                    # a normal closure instead of a bare TCP shutdown.
-                    try:
-                        await websocket.close(code=1000)
-                    except Exception:
-                        logger.debug(
-                            "Failed to close streaming speech websocket cleanly",
-                            exc_info=True,
-                        )
-                    return
-
-                elif msg_type in _VOICE_MSG_TYPES:
-                    if msg_type == "voice.add" and len(raw) > _MAX_VOICE_ADD_MESSAGE_SIZE:
-                        await self._send_error(websocket, "voice.add message too large")
-                        continue
-                    await self._handle_voice_message(websocket, msg)
-
-                else:
-                    await self._send_error(
-                        websocket,
-                        f"Unknown message type: {msg_type}",
-                    )
+            await self._run_classic_session(websocket, config)
+            return
 
         except WebSocketDisconnect:
             logger.info("Streaming speech: client disconnected")
@@ -283,6 +186,548 @@ class OmniStreamingSpeechHandler:
                 await self._send_error(websocket, f"Internal error: {e}")
             except Exception:
                 logger.debug("Failed to send error to streaming speech client", exc_info=True)
+
+    # ------------------------------------------------------------------
+    # Classic session (sentence/clause splitter, serial synthesis)
+    # ------------------------------------------------------------------
+
+    async def _run_classic_session(
+        self,
+        websocket: WebSocket,
+        config: StreamingSpeechSessionConfig,
+    ) -> None:
+        """Original behavior: split at sentence/clause boundaries and
+        synthesize one chunk at a time, in order, on the receive loop."""
+        timestamps_enabled = config.timestamp_type is not None
+        ts_async = (
+            timestamps_enabled
+            and config.timestamp_transport_strategy == "async"
+        )
+        boundary_re = SPLIT_CLAUSE if config.split_granularity == "clause" else SPLIT_SENTENCE
+        splitter = SentenceSplitter(boundary_re=boundary_re)
+        sentence_index = 0
+        pending_alignments: list[_PendingAlignment] = []
+        audio_offset: float = 0.0
+
+        while True:
+            try:
+                raw = await asyncio.wait_for(
+                    websocket.receive_text(),
+                    timeout=self._idle_timeout,
+                )
+            except asyncio.TimeoutError:
+                await self._send_error(websocket, "Idle timeout: no message received")
+                return
+
+            try:
+                msg = json.loads(raw)
+            except json.JSONDecodeError:
+                await self._send_error(websocket, "Invalid JSON message")
+                continue
+
+            if not isinstance(msg, dict):
+                await self._send_error(websocket, "WebSocket messages must be JSON objects")
+                continue
+
+            msg_type = msg.get("type")
+
+            if msg_type == "input.text":
+                if len(raw) > _MAX_INPUT_TEXT_MESSAGE_SIZE:
+                    await self._send_error(websocket, "input.text message too large")
+                    continue
+                text = msg.get("text", "")
+                if not isinstance(text, str):
+                    await self._send_error(websocket, "input.text requires a string value")
+                    continue
+                sentences = splitter.add_text(text)
+                for sentence in sentences:
+                    pa, duration = await self._generate_and_send(
+                        websocket, config, sentence, sentence_index,
+                        audio_offset=audio_offset,
+                    )
+                    audio_offset += duration
+                    if pa is not None:
+                        pending_alignments.append(pa)
+                    sentence_index += 1
+
+            elif msg_type == "input.done":
+                remaining = splitter.flush()
+                if remaining:
+                    pa, duration = await self._generate_and_send(
+                        websocket, config, remaining, sentence_index,
+                        audio_offset=audio_offset,
+                    )
+                    audio_offset += duration
+                    if pa is not None:
+                        pending_alignments.append(pa)
+                    sentence_index += 1
+
+                if ts_async and pending_alignments:
+                    await self._flush_async_timestamps(
+                        websocket, config, pending_alignments,
+                    )
+
+                await websocket.send_json(
+                    {
+                        "type": "session.done",
+                        "total_sentences": sentence_index,
+                    }
+                )
+                try:
+                    await websocket.close(code=1000)
+                except Exception:
+                    logger.debug(
+                        "Failed to close streaming speech websocket cleanly",
+                        exc_info=True,
+                    )
+                return
+
+            elif msg_type in _VOICE_MSG_TYPES:
+                if msg_type == "voice.add" and len(raw) > _MAX_VOICE_ADD_MESSAGE_SIZE:
+                    await self._send_error(websocket, "voice.add message too large")
+                    continue
+                await self._handle_voice_message(websocket, msg)
+
+            else:
+                await self._send_error(
+                    websocket,
+                    f"Unknown message type: {msg_type}",
+                )
+
+    # ------------------------------------------------------------------
+    # Asymmetric session (small lead chunk + larger steady chunks +
+    # optional prefetch pipeline)
+    # ------------------------------------------------------------------
+
+    async def _run_asymmetric_session(
+        self,
+        websocket: WebSocket,
+        config: StreamingSpeechSessionConfig,
+    ) -> None:
+        """Two-phase session: lead chunk for low TTFA then steady chunks
+        with optional N-deep prefetch."""
+        timestamps_enabled = config.timestamp_type is not None
+        ts_async = (
+            timestamps_enabled
+            and config.timestamp_transport_strategy == "async"
+        )
+        lead_re = SPLIT_CLAUSE if config.lead_boundary == "clause" else SPLIT_SENTENCE
+        splitter = AsymmetricSplitter(
+            lead_min_chars=config.lead_min_chars,
+            lead_boundary_re=lead_re,
+            steady_boundary_re=SPLIT_SENTENCE,
+            steady_units_per_chunk=config.steady_units_per_chunk,
+            steady_paragraph_break=config.steady_paragraph_break,
+        )
+
+        # Sentinel for end-of-input on the chunks queue.
+        END_OF_INPUT: object = object()
+        chunks_q: asyncio.Queue = asyncio.Queue()
+        first_text_seen = asyncio.Event()
+        lead_emitted_event = asyncio.Event()
+        # Serializes WebSocket writes since receiver, lead watcher, and the
+        # synthesis pipeline are concurrent tasks that can all emit frames.
+        ws_lock: asyncio.Lock = asyncio.Lock()
+
+        async def _locked_send_json(payload: dict[str, Any]) -> None:
+            async with ws_lock:
+                await websocket.send_json(payload)
+
+        async def _locked_send_error(message: str) -> None:
+            async with ws_lock:
+                await self._send_error(websocket, message)
+
+        # ----- timer fallback for lead chunk --------------------------
+        async def _lead_watcher() -> None:
+            if config.lead_max_wait_ms <= 0:
+                return
+            await first_text_seen.wait()
+            try:
+                await asyncio.wait_for(
+                    lead_emitted_event.wait(),
+                    timeout=config.lead_max_wait_ms / 1000.0,
+                )
+            except asyncio.TimeoutError:
+                forced = splitter.force_lead_flush()
+                if forced is not None:
+                    await chunks_q.put(forced)
+                    lead_emitted_event.set()
+
+        # ----- receiver loop (decoupled from synthesis) ---------------
+        async def _receiver() -> None:
+            try:
+                while True:
+                    try:
+                        raw = await asyncio.wait_for(
+                            websocket.receive_text(),
+                            timeout=self._idle_timeout,
+                        )
+                    except asyncio.TimeoutError:
+                        await _locked_send_error("Idle timeout: no message received")
+                        return
+
+                    try:
+                        msg = json.loads(raw)
+                    except json.JSONDecodeError:
+                        await _locked_send_error("Invalid JSON message")
+                        continue
+
+                    if not isinstance(msg, dict):
+                        await _locked_send_error(
+                            "WebSocket messages must be JSON objects"
+                        )
+                        continue
+
+                    msg_type = msg.get("type")
+                    if msg_type == "input.text":
+                        if len(raw) > _MAX_INPUT_TEXT_MESSAGE_SIZE:
+                            await _locked_send_error("input.text message too large")
+                            continue
+                        text = msg.get("text", "")
+                        if not isinstance(text, str):
+                            await _locked_send_error(
+                                "input.text requires a string value"
+                            )
+                            continue
+                        if text:
+                            first_text_seen.set()
+                        try:
+                            new_chunks = splitter.add_text(text)
+                        except ValueError as e:
+                            await _locked_send_error(str(e))
+                            return
+                        for c in new_chunks:
+                            await chunks_q.put(c)
+                            if c.is_lead:
+                                lead_emitted_event.set()
+
+                    elif msg_type == "input.done":
+                        final = splitter.flush()
+                        if final is not None:
+                            await chunks_q.put(final)
+                            if final.is_lead:
+                                lead_emitted_event.set()
+                        return
+
+                    elif msg_type in _VOICE_MSG_TYPES:
+                        if (
+                            msg_type == "voice.add"
+                            and len(raw) > _MAX_VOICE_ADD_MESSAGE_SIZE
+                        ):
+                            await _locked_send_error("voice.add message too large")
+                            continue
+                        # Serialize against in-flight audio frames.
+                        async with ws_lock:
+                            await self._handle_voice_message(websocket, msg)
+
+                    else:
+                        await _locked_send_error(
+                            f"Unknown message type: {msg_type}"
+                        )
+            finally:
+                # Always signal EOI so the pipeline drains and exits.
+                await chunks_q.put(END_OF_INPUT)
+                # Unblock the watcher if it is still waiting.
+                lead_emitted_event.set()
+                first_text_seen.set()
+
+        # ----- synthesis pipeline with prefetch -----------------------
+        async def _pipeline() -> int:
+            chunk_index = 0
+            audio_offset = 0.0
+            pending_alignments: list[_PendingAlignment] = []
+            in_flight: list[_AsymChunkJob] = []
+            prefetch = max(0, config.prefetch_lookahead)
+            done_receiving = False
+
+            async def _enqueue_next(chunk: StreamChunk) -> None:
+                nonlocal chunk_index
+                job = _AsymChunkJob(
+                    chunk_index=chunk_index,
+                    text=chunk.text,
+                    is_lead=chunk.is_lead,
+                )
+                chunk_index += 1
+                ic_override = (
+                    config.lead_initial_codec_chunk_frames if chunk.is_lead else None
+                )
+                job.producer = asyncio.create_task(
+                    self._produce_chunk_audio(job, config, ic_override)
+                )
+                in_flight.append(job)
+
+            try:
+                while True:
+                    # Fill the prefetch window (lookahead beyond the head).
+                    while not done_receiving and len(in_flight) <= prefetch:
+                        if in_flight:
+                            try:
+                                item = chunks_q.get_nowait()
+                            except asyncio.QueueEmpty:
+                                break
+                        else:
+                            item = await chunks_q.get()
+                        if item is END_OF_INPUT:
+                            done_receiving = True
+                            break
+                        await _enqueue_next(item)
+
+                    if not in_flight:
+                        if done_receiving:
+                            break
+                        continue
+
+                    head = in_flight.pop(0)
+                    pa, duration = await self._send_chunk_buffered(
+                        websocket, config, head, audio_offset, ws_lock=ws_lock,
+                    )
+                    audio_offset += duration
+                    if pa is not None:
+                        pending_alignments.append(pa)
+
+                if ts_async and pending_alignments:
+                    async with ws_lock:
+                        await self._flush_async_timestamps(
+                            websocket, config, pending_alignments
+                        )
+
+                await _locked_send_json(
+                    {
+                        "type": "session.done",
+                        "total_sentences": chunk_index,
+                    }
+                )
+                async with ws_lock:
+                    try:
+                        await websocket.close(code=1000)
+                    except Exception:
+                        logger.debug(
+                            "Failed to close streaming speech websocket cleanly",
+                            exc_info=True,
+                        )
+                return chunk_index
+            finally:
+                # Cancel any producers that didn't complete (e.g. on error).
+                for job in in_flight:
+                    if job.producer is not None and not job.producer.done():
+                        job.producer.cancel()
+                in_flight.clear()
+
+        watcher_task = asyncio.create_task(_lead_watcher())
+        receiver_task = asyncio.create_task(_receiver())
+        try:
+            await _pipeline()
+        finally:
+            for t in (watcher_task, receiver_task):
+                if not t.done():
+                    t.cancel()
+            for t in (watcher_task, receiver_task):
+                try:
+                    await t
+                except (asyncio.CancelledError, Exception):
+                    pass
+
+    async def _produce_chunk_audio(
+        self,
+        job: "_AsymChunkJob",
+        config: StreamingSpeechSessionConfig,
+        initial_codec_chunk_frames_override: int | None,
+    ) -> None:
+        """Synthesize audio for a single chunk into ``job``'s in-memory queue.
+
+        Runs independently of the WebSocket sender so multiple chunks can
+        be in-flight simultaneously when ``prefetch_lookahead > 0``. Bytes
+        sit in ``job.audio_queue`` until the sender drains them in order.
+        """
+        response_format = config.response_format or "wav"
+        initial_codec = (
+            initial_codec_chunk_frames_override
+            if initial_codec_chunk_frames_override is not None
+            else config.initial_codec_chunk_frames
+        )
+        request = OpenAICreateSpeechRequest(
+            input=job.text,
+            model=config.model,
+            voice=config.voice,
+            task_type=config.task_type,
+            language=config.language,
+            instructions=config.instructions,
+            response_format=response_format,
+            speed=config.speed,
+            max_new_tokens=config.max_new_tokens,
+            initial_codec_chunk_frames=initial_codec,
+            ref_audio=config.ref_audio,
+            ref_text=config.ref_text,
+            x_vector_only_mode=config.x_vector_only_mode,
+            speaker_embedding=config.speaker_embedding,
+            stream=config.stream_audio,
+        )
+        timestamps_enabled = config.timestamp_type is not None
+        try:
+            if config.stream_audio:
+                request_id, generator, _ = await self._speech_service._prepare_speech_generation(request)
+                job.request_id = request_id
+                async with aclosing(
+                    self._speech_service._generate_pcm_chunks(generator, request_id)
+                ) as stream:
+                    async for chunk in stream:
+                        job.total_bytes += len(chunk)
+                        if timestamps_enabled:
+                            job.pcm_buffers.append(chunk)
+                        await job.audio_queue.put(chunk)
+            else:
+                audio_bytes, _ = await self._speech_service._generate_audio_bytes(request)
+                job.total_bytes = len(audio_bytes)
+                if timestamps_enabled:
+                    job.pcm_buffers.append(
+                        _decode_audio_to_pcm(audio_bytes, response_format)
+                    )
+                await job.audio_queue.put(audio_bytes)
+        except asyncio.CancelledError:
+            if job.request_id is not None:
+                try:
+                    await self._speech_service.engine_client.abort(job.request_id)
+                except Exception:
+                    logger.debug(
+                        "Failed to abort prefetched chunk %d",
+                        job.chunk_index,
+                        exc_info=True,
+                    )
+            raise
+        except Exception as e:
+            logger.error(
+                "Generation failed for chunk %d: %s", job.chunk_index, e
+            )
+            job.error = e
+        finally:
+            await job.audio_queue.put(None)
+
+    async def _send_chunk_buffered(
+        self,
+        websocket: WebSocket,
+        config: StreamingSpeechSessionConfig,
+        job: "_AsymChunkJob",
+        audio_offset: float,
+        *,
+        ws_lock: "asyncio.Lock | None" = None,
+    ) -> "tuple[_PendingAlignment | None, float]":
+        """Drain a producer's audio_queue and write the chunk to WS in order.
+
+        Returns ``(pending_alignment_or_none, chunk_duration_seconds)`` so
+        the caller can keep timestamps continuous across the full session.
+
+        ``ws_lock`` is optional but should be provided whenever other tasks
+        (e.g. a receiver handling voice.* messages) might also write to
+        ``websocket`` concurrently with the pipeline.
+        """
+        response_format = config.response_format or "wav"
+        timestamps_enabled = config.timestamp_type is not None
+        ts_sync = timestamps_enabled and config.timestamp_transport_strategy == "sync"
+        ts_async = timestamps_enabled and config.timestamp_transport_strategy == "async"
+
+        async def _send_json(payload: dict[str, Any]) -> None:
+            if ws_lock is not None:
+                async with ws_lock:
+                    await websocket.send_json(payload)
+            else:
+                await websocket.send_json(payload)
+
+        async def _send_bytes(data: bytes) -> None:
+            if ws_lock is not None:
+                async with ws_lock:
+                    await websocket.send_bytes(data)
+            else:
+                await websocket.send_bytes(data)
+
+        start_payload: dict[str, Any] = {
+            "type": "audio.start",
+            "sentence_index": job.chunk_index,
+            "sentence_text": job.text,
+            "format": response_format,
+            "is_lead": job.is_lead,
+        }
+        if config.stream_audio and response_format == "pcm":
+            start_payload["sample_rate"] = _PCM_SAMPLE_RATE
+        await _send_json(start_payload)
+
+        sent_bytes = 0
+        try:
+            while True:
+                item = await job.audio_queue.get()
+                if item is None:
+                    break
+                sent_bytes += len(item)
+                await _send_bytes(item)
+        except WebSocketDisconnect:
+            if job.request_id is not None:
+                try:
+                    await self._speech_service.engine_client.abort(job.request_id)
+                except Exception:
+                    logger.debug(
+                        "Failed to abort streaming speech request %s",
+                        job.request_id,
+                        exc_info=True,
+                    )
+            raise
+
+        if job.error is not None:
+            err_msg = f"Generation failed for chunk {job.chunk_index}: {job.error}"
+            if ws_lock is not None:
+                async with ws_lock:
+                    await self._send_error(websocket, err_msg)
+            else:
+                await self._send_error(websocket, err_msg)
+
+        pcm_total = (
+            sum(len(b) for b in job.pcm_buffers) if job.pcm_buffers else sent_bytes
+        )
+        duration = pcm_total / 2.0 / _PCM_SAMPLE_RATE if pcm_total > 0 else 0.0
+
+        timestamp_info: dict[str, Any] | None = None
+        if ts_sync and job.error is None and job.pcm_buffers:
+            try:
+                audio_np = _pcm_bytes_to_float32(b"".join(job.pcm_buffers))
+                timestamp_info = await self._forced_aligner.align(  # type: ignore[union-attr]
+                    audio=audio_np,
+                    sample_rate=_PCM_SAMPLE_RATE,
+                    text=job.text,
+                    language=config.language or "Auto",
+                )
+                _offset_timestamps(timestamp_info, audio_offset)
+            except Exception as e:
+                logger.error(
+                    "Timestamp alignment failed for chunk %d: %s",
+                    job.chunk_index, e,
+                )
+
+        done_payload: dict[str, Any] = {
+            "type": "audio.done",
+            "sentence_index": job.chunk_index,
+            "total_bytes": sent_bytes,
+            "error": job.error is not None,
+        }
+        if timestamp_info is not None:
+            done_payload["timestamp_info"] = timestamp_info
+        try:
+            await _send_json(done_payload)
+        except Exception:
+            logger.debug(
+                "Failed to send audio.done for chunk %d",
+                job.chunk_index,
+                exc_info=True,
+            )
+
+        if ts_async and job.error is None and job.pcm_buffers:
+            return (
+                _PendingAlignment(
+                    sentence_index=job.chunk_index,
+                    sentence_text=job.text,
+                    pcm_data=b"".join(job.pcm_buffers),
+                    audio_offset=audio_offset,
+                ),
+                duration,
+            )
+        return None, duration
 
     async def _receive_config(self, websocket: WebSocket) -> StreamingSpeechSessionConfig | None:
         """Wait for and validate the session.config message.
@@ -355,6 +800,7 @@ class OmniStreamingSpeechHandler:
         sentence_index: int,
         *,
         audio_offset: float = 0.0,
+        initial_codec_chunk_frames_override: int | None = None,
     ) -> "tuple[_PendingAlignment | None, float]":
         """Generate audio for a single sentence and send it over WebSocket.
 
@@ -362,9 +808,19 @@ class OmniStreamingSpeechHandler:
         The caller accumulates durations to compute the global offset for
         the next sentence so that timestamps are continuous across the
         full audio stream.
+
+        ``initial_codec_chunk_frames_override`` overrides the session-level
+        ``initial_codec_chunk_frames`` for this single request only — used
+        by the asymmetric pipeline to apply a smaller initial chunk to the
+        lead utterance for lower TTFA.
         """
         response_format = config.response_format or "wav"
 
+        initial_codec = (
+            initial_codec_chunk_frames_override
+            if initial_codec_chunk_frames_override is not None
+            else config.initial_codec_chunk_frames
+        )
         request = OpenAICreateSpeechRequest(
             input=sentence_text,
             model=config.model,
@@ -375,7 +831,7 @@ class OmniStreamingSpeechHandler:
             response_format=response_format,
             speed=config.speed,
             max_new_tokens=config.max_new_tokens,
-            initial_codec_chunk_frames=config.initial_codec_chunk_frames,
+            initial_codec_chunk_frames=initial_codec,
             ref_audio=config.ref_audio,
             ref_text=config.ref_text,
             x_vector_only_mode=config.x_vector_only_mode,
@@ -697,5 +1153,38 @@ class _PendingAlignment:
         self.sentence_text = sentence_text
         self.pcm_data = pcm_data
         self.audio_offset = audio_offset
+
+
+class _AsymChunkJob:
+    """In-flight synthesis job for the asymmetric pipeline.
+
+    A producer task fills ``audio_queue`` with audio bytes (terminated by
+    ``None``) while the sender drains queues in chunk order, ensuring
+    overlap between synthesis of chunk N+1 and on-the-wire delivery of
+    chunk N when ``prefetch_lookahead > 0``.
+    """
+
+    __slots__ = (
+        "chunk_index",
+        "text",
+        "is_lead",
+        "audio_queue",
+        "pcm_buffers",
+        "total_bytes",
+        "request_id",
+        "error",
+        "producer",
+    )
+
+    def __init__(self, chunk_index: int, text: str, is_lead: bool) -> None:
+        self.chunk_index = chunk_index
+        self.text = text
+        self.is_lead = is_lead
+        self.audio_queue: asyncio.Queue = asyncio.Queue()
+        self.pcm_buffers: list[bytes] = []
+        self.total_bytes: int = 0
+        self.request_id: str | None = None
+        self.error: BaseException | None = None
+        self.producer: asyncio.Task | None = None
 
 
